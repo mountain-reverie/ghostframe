@@ -1214,6 +1214,7 @@ struct RepairBill {
     by_loss: u64,
     by_probe: u64,
     by_nack: u64,
+    by_handoff: u64,
 }
 
 fn repair_bill(r: &BrowserlessResult) -> RepairBill {
@@ -1234,6 +1235,7 @@ fn repair_bill(r: &BrowserlessResult) -> RepairBill {
         by_loss: i.loss_retransmits,
         by_probe: i.pto_probe_retransmits,
         by_nack: r.retransmit_by_nack,
+        by_handoff: i.block_handoff_queued,
     }
 }
 
@@ -1264,10 +1266,33 @@ fn repair_bill(r: &BrowserlessResult) -> RepairBill {
 /// by themselves.
 const RATIO_BOUND: f64 = 1.2;
 
-async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
+/// Totals of a P5a pass: missing records, retransmissions, and the causes
+/// that name them.
+struct P5aTotals {
+    lost: u64,
+    retx: u64,
+    loss: u64,
+    probe: u64,
+    nack: u64,
+    handoff: u64,
+}
+
+/// `fec_off` pins the control arm (the scenes' premise is the ARQ repair: the
+/// detector, the probe and the client's NACKs); without it the production
+/// adaptive FEC runs, engages on this 5 % loss, and hands the sources of
+/// blocks it did not recover to ARQ (`RetxCause::Handoff`), a fourth cause
+/// of retransmission (`f370a491` pinned the same arm for the P4 scenes).
+async fn p5a(ignore_client_nacks: bool, fec_off: bool) -> P5aTotals {
     const P5_RATE: f64 = 0.05;
     let ge = GilbertElliott::from_rate_and_burst(P5_RATE, BURST, 1.0).expect("feasible");
-    let (mut lost, mut retx, mut loss_repairs, mut by_nack) = (0u64, 0u64, 0u64, 0u64);
+    let mut t = P5aTotals {
+        lost: 0,
+        retx: 0,
+        loss: 0,
+        probe: 0,
+        nack: 0,
+        handoff: 0,
+    };
     for i in 0..5u64 {
         let seed = 0xB0_B057 ^ (i * 0x100);
         for (model, links) in [
@@ -1279,6 +1304,7 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
                 links,
                 RunOptions {
                     ignore_client_nacks,
+                    fec_off,
                     ..Default::default()
                 },
             )
@@ -1296,15 +1322,17 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
                 "{n}: premise: tombstones were evicted"
             );
             println!(
-                "P5A{} {n}: lost_records={} retransmits={} (loss={} probe={} nack={}) ratio={:.3} \
+                "P5A{}{} {n}: lost_records={} retransmits={} (loss={} probe={} nack={} handoff={}) ratio={:.3} \
                  cache_left={} tiles={} stale={} verdicts={} spurious={} k_pkt={} pto_fires={} \
                  critical_lat_mean_us={} max_us={} queued_crit_mean_us={}",
                 if ignore_client_nacks { "_ALONE" } else { "" },
+                if fec_off { "" } else { "_FEC" },
                 b.lost_records,
                 b.retransmits,
                 b.by_loss,
                 b.by_probe,
                 b.by_nack,
+                b.by_handoff,
                 b.retransmits as f64 / b.lost_records.max(1) as f64,
                 r.emitter_cache_entries,
                 tiles_present(&r),
@@ -1327,18 +1355,33 @@ async fn p5a(ignore_client_nacks: bool) -> (u64, u64, u64, u64) {
                 r.emitter_cache_entries, 0,
                 "{n}: passes left in the retransmit cache: sent, never acknowledged"
             );
-            lost += b.lost_records;
-            retx += b.retransmits;
-            loss_repairs += b.by_loss;
-            by_nack += b.by_nack;
+            if !fec_off {
+                // The accounting: every retransmission has one of four causes.
+                assert_eq!(
+                    b.by_loss + b.by_probe + b.by_nack + b.by_handoff,
+                    b.retransmits,
+                    "{n}: retransmissions not accounted by cause"
+                );
+            }
+            t.lost += b.lost_records;
+            t.retx += b.retransmits;
+            t.loss += b.by_loss;
+            t.probe += b.by_probe;
+            t.nack += b.by_nack;
+            t.handoff += b.by_handoff;
         }
     }
-    (lost, retx, loss_repairs, by_nack)
+    t
 }
 
 #[tokio::test(start_paused = true)]
 async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
-    let (lost, retx, loss_repairs, _) = p5a(false).await;
+    let P5aTotals {
+        lost,
+        retx,
+        loss: loss_repairs,
+        ..
+    } = p5a(false, true).await;
     let ratio = retx as f64 / lost as f64;
     println!("P5A pooled: retransmits={retx} lost_records={lost} ratio={ratio:.3}");
     assert!(lost >= 500, "premise: only {lost} missing records");
@@ -1361,7 +1404,13 @@ async fn p5a_a_lost_datagram_is_repaired_about_once_and_nothing_is_stranded() {
 /// mutation recorded in the PR).
 #[tokio::test(start_paused = true)]
 async fn p5a_alone_the_detector_and_the_probe_repair_everything_without_the_client() {
-    let (lost, retx, loss_repairs, by_nack) = p5a(true).await;
+    let P5aTotals {
+        lost,
+        retx,
+        loss: loss_repairs,
+        nack: by_nack,
+        ..
+    } = p5a(true, true).await;
     let ratio = retx as f64 / lost as f64;
     println!(
         "P5A_ALONE pooled: retransmits={retx} lost_records={lost} ratio={ratio:.3} detector={loss_repairs}"
@@ -1375,6 +1424,37 @@ async fn p5a_alone_the_detector_and_the_probe_repair_everything_without_the_clie
     assert!(
         ratio <= RATIO_BOUND,
         "{retx} retransmissions for {lost} missing records: {ratio:.3} > {RATIO_BOUND}"
+    );
+}
+
+/// P5a with the production adaptive FEC (the two tests above pin it off: their
+/// premise is the ARQ repair). FEC engages on this loss and repairs most of it
+/// before ARQ is asked; the sources of a block it did not recover are handed to
+/// ARQ (`RetxCause::Handoff`). Measured over the 10 runs: 559 retransmissions
+/// for 1097 missing records (0.510): 402 the detector's, 60 NACKs, 97
+/// hand-offs (seed 0xb0b357, burst), and every retransmission is one of loss,
+/// probe, NACK or hand-off. (With the client's NACKs dropped the same loss
+/// shows 60 more hand-offs, on seed 0xb0b257.)
+#[tokio::test(start_paused = true)]
+async fn p5a_with_fec_every_retransmission_has_a_cause_and_nothing_is_stranded() {
+    let t = p5a(false, false).await;
+    let ratio = t.retx as f64 / t.lost as f64;
+    println!(
+        "P5A_FEC pooled: retransmits={} lost_records={} ratio={ratio:.3} loss={} probe={} nack={} handoff={}",
+        t.retx, t.lost, t.loss, t.probe, t.nack, t.handoff
+    );
+    assert!(t.lost >= 500, "premise: only {} missing records", t.lost);
+    assert!(t.handoff > 0, "premise: FEC engaged and handed off nothing");
+    assert_eq!(
+        t.loss + t.probe + t.nack + t.handoff,
+        t.retx,
+        "pooled retransmissions not accounted by cause"
+    );
+    assert!(
+        ratio <= RATIO_BOUND,
+        "{} retransmissions for {} missing records: {ratio:.3} > {RATIO_BOUND}",
+        t.retx,
+        t.lost
     );
 }
 
