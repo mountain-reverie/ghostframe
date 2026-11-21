@@ -63,6 +63,10 @@ pub(super) struct PendingLoss {
     pub(super) wire_seq: u32,
     pub(super) emit_us: u64,
     pub(super) wire_bytes: usize,
+    /// It departed inside a probe burst (a window and the queue it left). The
+    /// burst overshoots the link by design and what it drops says nothing about
+    /// the rate the link carries, so goog_cc is not told of it.
+    pub(super) in_probe_burst: bool,
 }
 
 /// Outstanding transmissions the ledger will hold. Sized by send rate x round
@@ -539,10 +543,12 @@ impl IoBridge {
         // The loss is reported against the moment the datagram went out, the
         // same clock the acknowledgements' send times are on, not the moment
         // it was built.
+        let in_probe_burst = self.transmission_ledger.lost_in_probe_burst(wire_seq);
         self.pending_losses.push(PendingLoss {
             wire_seq,
             emit_us: tx.depart_us.unwrap_or(tx.emit_us),
             wire_bytes: tx.wire_bytes,
+            in_probe_burst,
         });
         self.loss_window
             .record(tx.emit_us as u32, true, tx.records.len() as u32);

@@ -1235,7 +1235,8 @@ mod tests {
     fn losses_followed_by_received_packets_limit_the_estimate() {
         let (clean, clean_bps) = drive_with_loss(0);
         let (lossy, lossy_bps) = drive_with_loss(3);
-        let limited = |s: &crate::transport::bwe::BweStats| s.loss_state_feedbacks[1..].iter().sum::<u64>();
+        let limited =
+            |s: &crate::transport::bwe::BweStats| s.loss_state_feedbacks[1..].iter().sum::<u64>();
         assert_eq!(limited(&clean), 0, "no loss, no loss limit: {clean:?}");
         assert!(
             limited(&lossy) > 100,

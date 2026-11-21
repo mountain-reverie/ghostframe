@@ -151,6 +151,9 @@ pub(super) struct Instruments {
     pub(super) nack_miss_not_owed: u64,
     pub(super) pto_probes_requested: u64,
     pub(super) losses_flushed: u64,
+    /// Declared lost, departed inside a probe burst, and so not reported to
+    /// goog_cc.
+    pub(super) losses_probe_burst: u64,
     /// Declared lost but dropped from the pending list by its cap.
     pub(super) losses_overflowed: u64,
     pub(super) flushed: crate::transport::instruments::FlushedLosses,

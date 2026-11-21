@@ -733,6 +733,16 @@ impl TransmissionLedger {
             .is_some_and(|t| t.departed.is_some_and(|d| self.is_patient(&t.tx, d)))
     }
 
+    /// Whether the verdict on `wire_seq` fell on a datagram that departed
+    /// inside a marked probe burst, whatever it carried (read from its
+    /// tombstone). [`Self::declared_lost_in_burst`] is the narrower question
+    /// of the loss path's patience, which only H.264 material gets.
+    pub fn lost_in_probe_burst(&self, wire_seq: u32) -> bool {
+        self.tombstones
+            .get(&wire_seq)
+            .is_some_and(|t| t.departed.is_some_and(|d| self.in_probe_burst(d)))
+    }
+
     /// Forget everything about the session that ended: the outstanding
     /// records (neither delivered nor lost to anyone who counts), the
     /// tombstones, the acknowledgement reference, the adapted threshold and
@@ -1434,6 +1444,36 @@ mod tests {
                     "and the verdict says it fell in the burst"
                 );
             }
+        }
+    }
+
+    /// `lost_in_probe_burst` is the question the estimator asks: it holds for
+    /// any content that departed inside a marked burst (a tile too, which gets
+    /// no patience), and for nothing outside one.
+    #[test]
+    fn a_loss_in_a_probe_burst_is_told_from_one_outside_it_whatever_it_carried() {
+        let thr = 100 * MS;
+        for (in_burst, tile) in [(true, true), (true, false), (false, true), (false, false)] {
+            let t0 = Instant::now();
+            let mut l = TransmissionLedger::new(64);
+            if in_burst {
+                l.mark_probe_burst(t0, t0 + 400 * MS);
+            }
+            let c = if tile {
+                Content::Tile(EmitKey::new(1, 0, 0, 0))
+            } else {
+                h264(1)
+            };
+            send_content(&mut l, 1, t0, c);
+            send(&mut l, 2, t0 + 1 * MS);
+            assert!(matches!(l.resolve(2), Some(Resolution::Live(_))));
+            let lost = l.detect_losses_at(t0 + 450 * MS, thr);
+            assert_eq!(lost.len(), 1, "in_burst={in_burst} tile={tile}");
+            assert_eq!(
+                l.lost_in_probe_burst(1),
+                in_burst,
+                "in_burst={in_burst} tile={tile}"
+            );
         }
     }
 
