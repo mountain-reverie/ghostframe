@@ -2799,7 +2799,10 @@ impl IoBridge {
             // on. Read before `update` so it reflects the state the
             // feedback describes.
             let in_flight = self.reliable_emitter.bytes_in_flight();
-            let reported = std::mem::take(&mut self.pending_losses);
+            let mut reported = std::mem::take(&mut self.pending_losses);
+            let before = reported.len();
+            reported.retain(|l| !l.in_probe_burst);
+            self.instr.losses_probe_burst += (before - reported.len()) as u64;
             self.instr.losses_flushed += reported.len() as u64;
             for l in &reported {
                 self.instr.flushed.insert(l.wire_seq);
