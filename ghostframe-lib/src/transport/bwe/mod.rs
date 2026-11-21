@@ -35,6 +35,10 @@ mod timeline;
 /// `BweSample`s the io_bridge accumulates at ACK-receive time.
 #[derive(Debug, Clone, Copy)]
 pub struct AckArrival {
+    /// The acknowledged transmission's id (`wire_seq`, a `u32` that wraps by
+    /// design). Becomes goog_cc's packet sequence number, unwrapped; see
+    /// `GoogCcDriver::update`.
+    pub wire_seq: u32,
     /// Server-side send time in microseconds on the emitter's clock, from the
     /// transmission ledger, so a retransmitted pass reports when it actually
     /// went out rather than when it first did. Full width: the datagram
@@ -267,14 +271,14 @@ impl BweWrapper {
     /// collected (typically `Instant::now()` at ACK-parse time).
     ///
     /// Returns the updated `BweSnapshot`.
-    /// `losses` are transmissions RTO fired on, as `(emit_us, wire_bytes)`,
-    /// from `ReliableTileEmitter::take_rto_losses`. They are the only loss
+    /// `losses` are transmissions declared lost, as
+    /// `(wire_seq, send_us, wire_bytes)`. They are the only loss
     /// signal the estimator receives; without them goog_cc's loss-based half
     /// never engages.
     pub fn update(
         &mut self,
         records: &[AckArrival],
-        losses: &[(u64, usize)],
+        losses: &[(u32, u64, usize)],
         now: Instant,
         data_in_flight_bytes: usize,
     ) -> BweSnapshot {
@@ -373,6 +377,7 @@ mod tests {
             .map(|i| {
                 let emit_us = (i as u64) * 1_000;
                 AckArrival {
+                    wire_seq: 0,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: 1200,
@@ -397,12 +402,14 @@ mod tests {
         let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, Instant::now());
         let records = vec![
             AckArrival {
+                wire_seq: 0,
                 server_emit_us: 100,
                 client_arrival_ms_lo16: 110,
                 size_bytes: 1200,
                 probe: None,
             },
             AckArrival {
+                wire_seq: 0,
                 server_emit_us: 120,
                 client_arrival_ms_lo16: 135,
                 size_bytes: 1200,
@@ -451,6 +458,7 @@ mod tests {
     #[test]
     fn ack_arrival_carries_packet_size() {
         let a = AckArrival {
+            wire_seq: 0,
             server_emit_us: 10,
             client_arrival_ms_lo16: 25,
             size_bytes: 1200,
@@ -466,6 +474,7 @@ mod tests {
     #[test]
     fn ack_arrival_emit_time_is_monotonic_micros() {
         let a = AckArrival {
+            wire_seq: 0,
             server_emit_us: 5_000_000,
             client_arrival_ms_lo16: 25,
             size_bytes: 1200,
@@ -490,6 +499,7 @@ mod tests {
                     // One-way delay grows 10 ms per step. Volume is constant.
                     let arrival_ms = emit_us / 1_000 + 15 + (step as u64) * 10;
                     AckArrival {
+                        wire_seq: 0,
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                         size_bytes: 1200,
@@ -528,6 +538,7 @@ mod tests {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
                     let arrival_ms = emit_us / 1_000 + 15;
                     AckArrival {
+                        wire_seq: 0,
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                         size_bytes: 1200,

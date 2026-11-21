@@ -40,6 +40,7 @@ fn run(steps: u32, capacity_bps: impl Fn(u32) -> u64) -> Vec<u64> {
             queue_free_us = arrive_us;
             let arrival_ms = arrive_us / 1_000 + 15; // + propagation
             batch.push(AckArrival {
+                wire_seq: 0,
                 server_emit_us: send_us,
                 client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                 size_bytes: PKT_BYTES,
@@ -128,6 +129,7 @@ fn request_a_real_probe(seed_bps: u64) -> (BweWrapper, Instant, ProbeRequest) {
     // Any non-empty batch trips `on_process_interval`; the content doesn't
     // matter to the probe path, only that `update()` runs once.
     let seed_batch = vec![AckArrival {
+        wire_seq: 0,
         server_emit_us: 0,
         client_arrival_ms_lo16: 15,
         size_bytes: PKT_BYTES,
@@ -163,6 +165,7 @@ fn tagged_probe_packet(
     let send_us = 100_000 + (i as u64) * 1_000;
     let arrival_ms = send_us / 1_000 + 10 + i as u64;
     AckArrival {
+        wire_seq: 0,
         server_emit_us: send_us,
         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
         size_bytes: pkt_bytes,
@@ -228,6 +231,7 @@ fn a_requested_probe_cluster_is_filled_and_consumed() {
     let control_before = control.snapshot().bitrate_bps;
     let control_batch: Vec<AckArrival> = (0..n)
         .map(|i| AckArrival {
+            wire_seq: 0,
             probe: None,
             ..tagged_probe_packet(&req, i, pkt_bytes, 0)
         })
@@ -305,6 +309,7 @@ fn an_underfilled_probe_cluster_is_discarded_silently() {
     let (mut control, ct0, _) = request_a_real_probe(1_000_000);
     let control_batch: Vec<AckArrival> = (0..n)
         .map(|i| AckArrival {
+            wire_seq: 0,
             probe: None,
             ..tagged_probe_packet(&req, i, pkt_bytes, 0)
         })
@@ -428,6 +433,7 @@ fn untagged_traffic_tracks_normally_around_a_pending_probe() {
             .map(|i| {
                 let emit_us = ((step * 20 + i) as u64) * 1_000;
                 AckArrival {
+                    wire_seq: 0,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: PKT_BYTES,

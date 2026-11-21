@@ -177,12 +177,35 @@ const AIMD_BACKOFF_F: f64 = super::ceiling::AIMD_BACKOFF;
 /// pacer rate is the estimate.
 const PACING_FACTOR: f64 = 1.0;
 
+/// Unwraps `u32` transmission ids (`wire_seq`, wrapping by design) onto an
+/// `i64` line that increases with them, anchored on the newest seen.
+#[derive(Debug, Default, Clone, Copy)]
+struct SeqUnwrap {
+    anchor: Option<i64>,
+}
+
+impl SeqUnwrap {
+    /// `seq` unwrapped (within 2^31 of the anchor), moving the anchor up to it.
+    fn advance(&mut self, seq: u32) -> i64 {
+        let u = match self.anchor {
+            None => i64::from(seq),
+            Some(a) => a + i64::from(seq.wrapping_sub(a as u32) as i32),
+        };
+        if self.anchor.is_none_or(|a| u > a) {
+            self.anchor = Some(u);
+        }
+        u
+    }
+}
+
 pub(crate) struct GoogCcDriver {
     ctl: SendCtl,
     /// Only the arrival series needs unwrapping: it crosses the wire as 16
     /// bits of the client's clock. `server_emit_us` is already monotonic
     /// server-side microseconds and is used directly.
     arrival_time: Lo16Timeline,
+    /// Unwraps transmission ids into goog_cc's packet sequence numbers.
+    seq: SeqUnwrap,
     base: Instant,
     /// goog_cc's raw target rate. What is published is `gate.published`.
     estimate_bps: u64,
@@ -219,7 +242,7 @@ pub(crate) struct GoogCcDriver {
     /// last discarded the lower rung — the one more likely to be answerable
     /// on a slow link. Bounded by `MAX_PENDING_PROBE_REQUESTS`.
     pending_probe_requests: std::collections::VecDeque<super::ProbeRequest>,
-    stats: super::BweStats,
+    stats: crate::transport::bwe::BweStats,
     /// The acknowledged-rate ceiling (`ceiling.rs`) and the figures it is
     /// made of. `active_ceiling_bps` is `Some` only while the sender was
     /// saturated; it bounds what `snapshot` reports.
@@ -404,9 +427,10 @@ impl GoogCcDriver {
             samples_seen: 0,
             path_rtt: None,
             implausible_rtt_samples: 0,
+            seq: SeqUnwrap::default(),
             pacer_rate_bps: None,
             pending_probe_requests: std::collections::VecDeque::new(),
-            stats: super::BweStats::default(),
+            stats: crate::transport::bwe::BweStats::default(),
             ceiling: EstimateCeiling::default(),
             acked_cum_bytes: 0.0,
             active_ceiling_bps: None,
@@ -721,7 +745,7 @@ impl GoogCcDriver {
     pub(crate) fn update(
         &mut self,
         records: &[AckArrival],
-        losses: &[(u64, usize)],
+        losses: &[(u32, u64, usize)],
         now: Instant,
         data_in_flight_bytes: usize,
     ) -> BweSnapshot {
@@ -780,6 +804,7 @@ impl GoogCcDriver {
             send_ms_max = send_ms_max.max(send_ms);
             last_derived = Duration::from_millis((recv_ms - send_ms).max(0) as u64);
             let sent = SentPacket {
+                sequence_number: self.seq.advance(r.wire_seq),
                 send_time: Timestamp::from_millis(send_ms),
                 size: DataSize::from_bytes(r.size_bytes as i64),
                 // BWE Stage 2.4: tag this `SentPacket` as a probe packet
@@ -799,6 +824,14 @@ impl GoogCcDriver {
                 ..Default::default()
             });
         }
+        // Sequence numbers: goog_cc's loss-based estimator (v2) keys the
+        // packets lost within an observation by `sequence_number` and drops a
+        // key when a packet of that number is received. Left at the default 0,
+        // every loss inserted key 0 and the next received packet removed it,
+        // so it counted at most one loss per observation and usually none.
+        // Each transmission carries its own id (a retransmission is a new
+        // transmission), unwrapped so it stays increasing across the u32 wrap.
+        //
         // Losses, reported as feedback entries with no receive time.
         // `PacketResult::is_received` is `!receive_time.is_plus_infinity()`
         // and goog_cc's `lost_packets()` filters on exactly that, so an
@@ -808,10 +841,11 @@ impl GoogCcDriver {
         // ~750 kB of loss left the estimate pinned at its pre-drop 16.4 Mbps
         // in 5 runs out of 6, a sustained 4x overestimate of a degraded
         // link.
-        for &(emit_us, size_bytes) in losses {
+        for &(wire_seq, emit_us, size_bytes) in losses {
             let send_ms = (emit_us / 1_000) as i64;
             send_ms_max = send_ms_max.max(send_ms);
             let sent = SentPacket {
+                sequence_number: self.seq.advance(wire_seq),
                 send_time: Timestamp::from_millis(send_ms),
                 size: DataSize::from_bytes(size_bytes as i64),
                 // Never a probe: a retransmission belongs to no cluster
@@ -830,7 +864,7 @@ impl GoogCcDriver {
         }
         // goog_cc walks this vector in order; keep sends monotonic so a
         // loss interleaved with acknowledgements lands where it belongs.
-        packet_feedbacks.sort_by_key(|f| f.sent_packet.send_time);
+        packet_feedbacks.sort_by_key(|f| (f.sent_packet.send_time, f.sent_packet.sequence_number));
 
         feedback_time = feedback_time.max(Timestamp::from_millis(send_ms_max));
         self.samples_seen += records.len() as u64;
@@ -1126,6 +1160,7 @@ mod tests {
                 .map(|i| {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
                     AckArrival {
+                        wire_seq: 0,
                         server_emit_us: emit_us,
                         // 15 ms one-way delay, constant.
                         client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
@@ -1153,6 +1188,77 @@ mod tests {
             "estimate never moved off the starting rate — the controller's \
              updates are not being absorbed"
         );
+    }
+
+    /// goog_cc's loss-based estimator (v2) keys the packets lost inside an
+    /// observation by sequence number and forgets a key when a packet of that
+    /// number is received. With every packet numbered 0, a loss followed by
+    /// received packets cancelled itself, so a path dropping 25 % of what it
+    /// was sent looked loss-free and the estimator never limited the rate.
+    /// Same sends and same arrivals twice, with and without the lost packets.
+    fn drive_with_loss(lost_per_batch: u32) -> (crate::transport::bwe::BweStats, u64) {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(3_000_000, t0);
+        let mut next_seq = 0u32;
+        for step in 0..1000u32 {
+            let mut batch = Vec::new();
+            let mut losses = Vec::new();
+            for i in 0..12u32 {
+                let emit_us = ((step * 20 + i) as u64) * 1_000;
+                let wire_seq = next_seq;
+                next_seq += 1;
+                // The lost packets sit early in the batch, so received packets
+                // follow them in send order.
+                if i < lost_per_batch {
+                    losses.push((wire_seq, emit_us, 1200usize));
+                } else {
+                    batch.push(AckArrival {
+                        wire_seq,
+                        server_emit_us: emit_us,
+                        client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                        size_bytes: 1200,
+                        probe: None,
+                    });
+                }
+            }
+            d.update(
+                &batch,
+                &losses,
+                t0 + Duration::from_millis(20 * step as u64 + 30),
+                14_400,
+            );
+        }
+        (d.snapshot().stats, d.snapshot().bitrate_bps)
+    }
+
+    #[test]
+    fn losses_followed_by_received_packets_limit_the_estimate() {
+        let (clean, clean_bps) = drive_with_loss(0);
+        let (lossy, lossy_bps) = drive_with_loss(3);
+        let limited = |s: &crate::transport::bwe::BweStats| s.loss_state_feedbacks[1..].iter().sum::<u64>();
+        assert_eq!(limited(&clean), 0, "no loss, no loss limit: {clean:?}");
+        assert!(
+            limited(&lossy) > 100,
+            "25 % loss never reached the loss-based estimator: {lossy:?}"
+        );
+        assert!(
+            lossy_bps < clean_bps,
+            "loss did not lower the estimate: {lossy_bps} vs {clean_bps}"
+        );
+    }
+
+    #[test]
+    fn transmission_ids_unwrap_across_the_u32_wrap() {
+        let mut u = super::SeqUnwrap::default();
+        let a = u.advance(u32::MAX - 2);
+        let b = u.advance(u32::MAX - 1);
+        let c = u.advance(0); // NO_ACK (u32::MAX) is skipped by the allocator
+        let d = u.advance(1);
+        assert!(a < b && b < c && c < d, "{a} {b} {c} {d}");
+        // A late straggler from before the wrap keeps its place and does not
+        // move the anchor back.
+        assert_eq!(u.advance(u32::MAX - 1), b);
+        assert_eq!(u.advance(2), d + 1);
     }
 
     /// Drive `d` for `secs` with a clean path delivering `ACKED_BPS`, and an
@@ -1191,6 +1297,7 @@ mod tests {
                 .map(|i| {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
                     AckArrival {
+                        wire_seq: 0,
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                         size_bytes: 1200,
@@ -1223,6 +1330,7 @@ mod tests {
                     .map(|i| {
                         let emit_us = ((step * 20 + i) as u64) * 1_000;
                         AckArrival {
+                            wire_seq: 0,
                             server_emit_us: emit_us,
                             client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                             size_bytes: 1200,
@@ -1256,6 +1364,7 @@ mod tests {
                 .map(|i| {
                     let emit_us = (period_ms * step as u64) * 1_000 + u64::from(i) * 100;
                     AckArrival {
+                        wire_seq: 0,
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: ((emit_us / 1_000 + rtt_ms / 2) & 0xFFFF) as u16,
                         size_bytes: 960,
@@ -1498,6 +1607,7 @@ mod tests {
                         // Constant 15 ms one-way delay; only the epoch differs.
                         let arrival_ms = emit_us / 1_000 + 15 + offset_ms;
                         AckArrival {
+                            wire_seq: 0,
                             server_emit_us: emit_us,
                             client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                             size_bytes: 1200,
@@ -1575,6 +1685,7 @@ mod tests {
             .map(|i| {
                 let emit_us = (i as u64) * 1_000;
                 AckArrival {
+                    wire_seq: 0,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: 1200,
@@ -1672,6 +1783,7 @@ mod tests {
             bytes_sent_before: 0,
         };
         let records = vec![AckArrival {
+            wire_seq: 0,
             server_emit_us: 0,
             client_arrival_ms_lo16: 15,
             size_bytes: 1200,
@@ -1732,6 +1844,7 @@ mod tests {
                 .map(|i| {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
                     AckArrival {
+                        wire_seq: 0,
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                         size_bytes: 1200,
@@ -1797,6 +1910,7 @@ mod tests {
         // wire): 11 x 1200 B over 11 ms = 9_600_000 bit/s.
         let batch: Vec<AckArrival> = (0..12u32)
             .map(|i| AckArrival {
+                wire_seq: 0,
                 server_emit_us: 1_000 * i as u64,
                 client_arrival_ms_lo16: (15 + i) as u16,
                 size_bytes: 1200,
@@ -1825,6 +1939,7 @@ mod tests {
             }
             let emit_us = step * 20_000;
             let rec = AckArrival {
+                wire_seq: 0,
                 server_emit_us: emit_us,
                 client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                 size_bytes: 1200,
