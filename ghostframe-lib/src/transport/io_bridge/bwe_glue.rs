@@ -68,6 +68,8 @@ pub(super) struct PendingLoss {
     /// burst overshoots the link by design and what it drops says nothing about
     /// the rate the link carries, so goog_cc is not told of it.
     pub(super) in_probe_burst: bool,
+    /// Where in the burst, and what it carried (measurement).
+    pub(super) burst: Option<crate::transport::transmission_ledger::BurstClass>,
     /// What the ledger loss gate makes of it: a loss the stream's own queue (or
     /// quinn's own discard) explains, or one the path dropped. Reported, not
     /// acted on.
@@ -364,8 +366,11 @@ impl IoBridge {
         );
         // The datagrams that depart in this window and just after it sit in
         // its queue: the loss path's time rule is patient with them.
-        self.transmission_ledger
-            .mark_probe_burst(now, now + duration + PROBE_BURST_DRAIN);
+        self.transmission_ledger.mark_probe_window(
+            now,
+            now + duration,
+            now + duration + PROBE_BURST_DRAIN,
+        );
         self.active_probe = Some(ActiveProbe {
             id,
             target_rate_bps,
@@ -571,6 +576,7 @@ impl IoBridge {
             emit_us: tx.depart_us.unwrap_or(tx.emit_us),
             wire_bytes: tx.wire_bytes,
             in_probe_burst,
+            burst: self.transmission_ledger.probe_burst_class(wire_seq),
             class,
         };
         // Held until the client's report counts a gap for it.

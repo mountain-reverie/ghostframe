@@ -154,6 +154,8 @@ pub(super) struct Instruments {
     /// Declared lost, departed inside a probe burst, and so not reported to
     /// goog_cc.
     pub(super) losses_probe_burst: u64,
+    /// Of those, `[tile, h264, pad][in the window, in the drain]`.
+    pub(super) losses_probe_burst_by: [[u64; 2]; 3],
     /// By class (queue, local, path): confirmed by a LOSS_REPORT gap, and so
     /// let through to goog_cc (before the probe-burst filter), and unconfirmed
     /// when their wait ran out (phantoms: the client had the datagram).
@@ -576,6 +578,8 @@ impl IoBridge {
             admission: i.admission,
             ledger_losses_declared: i.losses_declared,
             ledger_losses_flushed: i.losses_flushed,
+            ledger_losses_probe_burst: i.losses_probe_burst,
+            ledger_losses_probe_burst_by: i.losses_probe_burst_by,
             ledger_loss_class_confirmed: i.loss_class_confirmed,
             ledger_loss_class_unconfirmed: i.loss_class_unconfirmed,
             ledger_losses_overflowed: i.losses_overflowed,
