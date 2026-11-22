@@ -2561,3 +2561,271 @@ async fn the_start_up_overflow_is_excused_and_adaptive_stays_clean() {
         assert_eq!(repairs(&r), 0, "seed {seed:#x}");
     }
 }
+
+// ---- one short outage on a clean link (report only) -------------------------
+//
+// How much does adaptive FEC cost after a single total outage (every datagram
+// dropped both ways) on an otherwise clean link? Not a gate: it prints
+// `FECOUT` lines. A run is read at checkpoints, each a separate scene of that
+// length (stepped scenes are byte-reproducible from the seed, so a shorter
+// run is a prefix of a longer one, as `engage_ms` relies on); the cumulative
+// counters at two checkpoints give an interval's repair overhead, and the
+// first checkpoint at which the controller is not engaged brackets the
+// release, which is then bisected to `OUTAGE_RES_MS`.
+//
+//   GHOSTFRAME_FEC_OUTAGE_CAPS=2,10,30   link rates, Mbit/s
+//   GHOSTFRAME_FEC_OUTAGE_SEEDS=3        seeds per cell (1..=5)
+//   GHOSTFRAME_FEC_OUTAGE_MS=300         the outage's length
+
+const OUTAGE_AT_MS: u64 = 15_000;
+const OUTAGE_RES_MS: u64 = 250;
+/// Window after the outage in which the media rate and the estimate are read.
+const OUTAGE_WINDOW_MS: u64 = 20_000;
+
+/// A clean sweep cell, with the outage as a step in the server-to-client
+/// loss and a total cap of zero on the client-to-server path.
+fn outage_scene(
+    cap: u64,
+    seed: u64,
+    ms: u64,
+    outage_ms: Option<u64>,
+) -> (BrowserlessScene, LinkOverrides) {
+    let (scene, mut links) = sweep_scene(Cell::new(Load::H264, Loss::Clean, cap), seed, ms, 1.0);
+    let (from, to) = (
+        OUTAGE_AT_MS * 1000,
+        (OUTAGE_AT_MS + outage_ms.unwrap_or(0)) * 1000,
+    );
+    let mut points = vec![(0, u64::MAX)];
+    if outage_ms.is_some() {
+        links.s2c_loss_steps = vec![(from, 1.0), (to, 0.0)];
+        points = vec![(0, u64::MAX), (from, 0), (to, u64::MAX)];
+    }
+    links.c2s = Some(NetProfile {
+        delay_us: 25_000,
+        cap: CapTimeline { points },
+        ..NetProfile::perfect()
+    });
+    (scene, links)
+}
+
+/// One checkpoint's cumulative readings.
+#[derive(Clone, Debug, Default)]
+struct OutSnap {
+    ck_ms: u64,
+    engaged: bool,
+    p_hat_ppm: u64,
+    b_hat_x100: u64,
+    r8: u8,
+    r64: u8,
+    k_max: u8,
+    t_ms: u8,
+    src_bytes: u64,
+    repair_bytes: u64,
+    dropped: u64,
+    lost_pre_fec: u64,
+    recovered: u64,
+    retx: u64,
+    excused: u64,
+    queue_losses: u64,
+    local_losses: u64,
+    skips: u64,
+    floor_changes: u64,
+    shown: usize,
+    late: usize,
+    never_fed: usize,
+    /// Frames shown, and the estimate's mean, inside the window after the
+    /// outage; the first and last display instants, to check the clock.
+    win_shown: usize,
+    win_est_bps: f64,
+    first_show_us: u64,
+    last_show_us: u64,
+}
+
+fn out_snap(r: &BrowserlessResult, ck_ms: u64, outage_ms: u64) -> OutSnap {
+    let (t, i, a) = (&r.transport, &r.transport.instr, &r.transport.adapt);
+    let repair_bytes = repairs(r);
+    let (shown, late, never_fed) = frames_late(r);
+    let (w0, w1) = (
+        (OUTAGE_AT_MS + outage_ms) * 1000,
+        (OUTAGE_AT_MS + outage_ms + OUTAGE_WINDOW_MS) * 1000,
+    );
+    let show: Vec<u64> = r
+        .h264_run()
+        .map(|run| {
+            let mut seen = std::collections::HashSet::new();
+            run.display
+                .iter()
+                .filter(|rec| seen.insert(rec.frame_seq))
+                .map(|rec| rec.at_us)
+                .collect()
+        })
+        .unwrap_or_default();
+    let est: Vec<f64> = r
+        .bwe_estimate_samples
+        .iter()
+        .filter(|(t, _)| (w0..w1).contains(t))
+        .map(|(_, b)| *b as f64)
+        .collect();
+    OutSnap {
+        ck_ms,
+        engaged: a.engaged,
+        p_hat_ppm: a.p_hat_ppm,
+        b_hat_x100: a.b_hat_x100,
+        r8: a.r_at_k8,
+        r64: a.r_at_k64,
+        k_max: a.k_max,
+        t_ms: a.t_ms,
+        src_bytes: i.offered.total().saturating_sub(repair_bytes),
+        repair_bytes,
+        dropped: r.s2c_datagrams_dropped,
+        lost_pre_fec: t.report_lost_pre_fec_total,
+        recovered: t.client_recovered,
+        retx: r.retransmit_attempts_total,
+        excused: a.losses_excused,
+        queue_losses: a.queue_losses,
+        local_losses: a.local_losses,
+        skips: a.congestion_skips,
+        floor_changes: a.floor_changes,
+        shown,
+        late,
+        never_fed,
+        win_shown: show.iter().filter(|t| (w0..w1).contains(t)).count(),
+        win_est_bps: mean(&est),
+        first_show_us: show.iter().copied().min().unwrap_or(0),
+        last_show_us: show.iter().copied().max().unwrap_or(0),
+    }
+}
+
+async fn out_run(cap: u64, seed: u64, arm: Arm, outage_ms: Option<u64>, ck_ms: u64) -> OutSnap {
+    let (scene, links) = outage_scene(cap, seed, ck_ms, outage_ms);
+    let r = run_browserless_with_options(scene, links, arm.options())
+        .await
+        .expect("scene ran");
+    let s = out_snap(&r, ck_ms, outage_ms.unwrap_or(0));
+    println!(
+        "FECOUT ck cap={cap} seed={seed:#x} arm={} outage={} ck_ms={ck_ms} engaged={} p_hat_ppm={} \
+         b_hat_x100={} r8={} r64={} k_max={} t_ms={} src_bytes={} repair_bytes={} dropped={} \
+         lost_pre_fec={} recovered={} retx={} excused={} queue_losses={} local_losses={} skips={} \
+         floor_changes={} shown={} late={} never_fed={} win_shown={} win_est_bps={:.0} \
+         show_us={}..{}",
+        arm.name(),
+        outage_ms.is_some(),
+        s.engaged,
+        s.p_hat_ppm,
+        s.b_hat_x100,
+        s.r8,
+        s.r64,
+        s.k_max,
+        s.t_ms,
+        s.src_bytes,
+        s.repair_bytes,
+        s.dropped,
+        s.lost_pre_fec,
+        s.recovered,
+        s.retx,
+        s.excused,
+        s.queue_losses,
+        s.local_losses,
+        s.skips,
+        s.floor_changes,
+        s.shown,
+        s.late,
+        s.never_fed,
+        s.win_shown,
+        s.win_est_bps,
+        s.first_show_us,
+        s.last_show_us
+    );
+    s
+}
+
+fn env_list(name: &str, default: &[u64]) -> Vec<u64> {
+    std::env::var(name).ok().map_or_else(
+        || default.to_vec(),
+        |v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "report only: prints FECOUT lines"]
+async fn one_short_outage_on_a_clean_link() {
+    let caps = env_list("GHOSTFRAME_FEC_OUTAGE_CAPS", &[2, 10, 30]);
+    let n = env_list("GHOSTFRAME_FEC_OUTAGE_SEEDS", &[3])[0].clamp(1, 5) as usize;
+    let outage = env_list("GHOSTFRAME_FEC_OUTAGE_MS", &[300])[0];
+    let end = OUTAGE_AT_MS + outage;
+    let win_end = end + OUTAGE_WINDOW_MS;
+    for cap in caps {
+        for &seed in &SWEEP_SEEDS[..n] {
+            // Control: adaptive, no outage; and the FEC-off arms.
+            for ck in [OUTAGE_AT_MS, win_end, 60_000] {
+                out_run(cap, seed, Arm::Adaptive, None, ck).await;
+            }
+            out_run(cap, seed, Arm::Off, None, win_end).await;
+            out_run(cap, seed, Arm::Off, Some(outage), win_end).await;
+            // The outage arm, read at checkpoints.
+            let cks = [
+                OUTAGE_AT_MS,
+                end,
+                end + 300,
+                end + 1_000,
+                end + 2_000,
+                end + 3_000,
+                end + 5_000,
+                end + 8_000,
+                end + 10_000,
+                end + 15_000,
+                win_end,
+                end + 30_000,
+                60_000,
+            ];
+            let mut snaps: Vec<OutSnap> = Vec::new();
+            for ck in cks {
+                snaps.push(out_run(cap, seed, Arm::Adaptive, Some(outage), ck).await);
+            }
+            // The release: the first checkpoint after the first engaged one
+            // that is not engaged, bisected.
+            let first = snaps.iter().position(|s| s.ck_ms > end && s.engaged);
+            let release =
+                first.and_then(|f| snaps[f..].iter().position(|s| !s.engaged).map(|p| f + p));
+            match release {
+                Some(rel) => {
+                    let (mut lo, mut hi) = (snaps[rel - 1].ck_ms, snaps[rel].ck_ms);
+                    let mut at_release = snaps[rel].clone();
+                    let mut last_engaged = snaps[rel - 1].clone();
+                    while hi - lo > OUTAGE_RES_MS {
+                        let mid = (lo + hi) / 2;
+                        let s = out_run(cap, seed, Arm::Adaptive, Some(outage), mid).await;
+                        if s.engaged {
+                            lo = mid;
+                            last_engaged = s;
+                        } else {
+                            hi = mid;
+                            at_release = s;
+                        }
+                    }
+                    println!(
+                        "FECOUT release cap={cap} seed={seed:#x} outage_ms={outage} released_after_ms={} \
+                         (bracket {lo}..{hi}) last_engaged: p_hat_ppm={} b_hat_x100={} r8={} r64={} k_max={} \
+                         | first_after_release: p_hat_ppm={} b_hat_x100={}",
+                        hi - end,
+                        last_engaged.p_hat_ppm,
+                        last_engaged.b_hat_x100,
+                        last_engaged.r8,
+                        last_engaged.r64,
+                        last_engaged.k_max,
+                        at_release.p_hat_ppm,
+                        at_release.b_hat_x100
+                    );
+                }
+                None => println!(
+                    "FECOUT release cap={cap} seed={seed:#x} outage_ms={outage} released_after_ms={}",
+                    if first.is_some() {
+                        "still_engaged_at_end"
+                    } else {
+                        "never_engaged"
+                    }
+                ),
+            }
+        }
+    }
+}
