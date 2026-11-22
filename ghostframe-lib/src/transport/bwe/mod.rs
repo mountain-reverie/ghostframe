@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 mod ceiling;
 pub(crate) use ceiling::SATURATION;
 mod googcc;
+#[cfg(feature = "browserless-harness")]
+pub use googcc::set_inherent_loss_guard;
 mod growth_gate;
 mod probe_meter;
 #[cfg(test)]
