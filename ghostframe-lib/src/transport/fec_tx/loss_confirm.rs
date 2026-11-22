@@ -227,13 +227,14 @@ impl<T> LossConfirmer<T> {
         let mut out = std::mem::take(&mut self.pushed_out);
         let newest = newest_sent.map(|n| self.seq.at(n));
         while let Some(&(at, key)) = self.by_time.front() {
-            if !self.held.get(&key).is_some_and(|(a, _)| *a == at) {
+            if self.held.get(&key).is_none_or(|(a, _)| *a != at) {
                 self.by_time.pop_front();
                 continue;
             }
             let age = now_ms.saturating_sub(at);
             let passed = newest.is_some_and(|n| n - key >= MIN_NEWER_SENT);
-            if !(age >= MAX_AGE_MS || (age >= TTL_MS && passed)) {
+            let may_expire = age >= MAX_AGE_MS || (age >= TTL_MS && passed);
+            if !may_expire {
                 break;
             }
             self.by_time.pop_front();
