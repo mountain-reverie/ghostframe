@@ -2807,6 +2807,17 @@ impl IoBridge {
             let in_flight = self.reliable_emitter.bytes_in_flight();
             let mut reported = std::mem::take(&mut self.pending_losses);
             let before = reported.len();
+            for l in reported.iter().filter(|l| l.in_probe_burst) {
+                if let Some(b) = l.burst {
+                    use crate::transport::transmission_ledger::BurstKind;
+                    let k = match b.kind {
+                        BurstKind::Tile => 0,
+                        BurstKind::H264 => 1,
+                        BurstKind::Pad => 2,
+                    };
+                    self.instr.losses_probe_burst_by[k][usize::from(!b.in_window)] += 1;
+                }
+            }
             reported.retain(|l| !l.in_probe_burst);
             self.instr.losses_probe_burst += (before - reported.len()) as u64;
             self.instr.losses_flushed += reported.len() as u64;

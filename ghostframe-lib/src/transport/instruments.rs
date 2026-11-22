@@ -674,6 +674,10 @@ pub struct InstrumentSummary {
     pub ledger_losses_declared: u64,
     /// Of those, handed to goog_cc.
     pub ledger_losses_flushed: u64,
+    /// Confirmed, then withheld from goog_cc because they departed in a probe
+    /// burst, in total and by `[tile, h264, pad][window, drain]`.
+    pub ledger_losses_probe_burst: u64,
+    pub ledger_losses_probe_burst_by: [[u64; 2]; 3],
     /// Declared losses by class `[queue, local, path]`: those the client's
     /// LOSS_REPORT confirmed (goog_cc is told of them, probe bursts aside) and
     /// those it never did (phantoms, dropped unreported).

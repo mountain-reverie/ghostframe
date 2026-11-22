@@ -1285,6 +1285,10 @@ async fn run_inner(
         transport.instr.ledger_loss_class_confirmed,
         transport.instr.ledger_loss_class_unconfirmed,
     );
+    println!(
+        "PROBEBURST removed={} by[tile,h264,pad][win,drain]={:?}",
+        transport.instr.ledger_losses_probe_burst, transport.instr.ledger_losses_probe_burst_by,
+    );
     let send_datagram_errs = *send_errs_cell.lock().expect("send_errs mutex poisoned");
     let tiles_with_pass0_sent = pass0_cell.lock().unwrap().len();
     let (probes_completed, probes_abandoned) = *probe_stats_cell

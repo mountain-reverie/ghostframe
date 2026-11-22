@@ -81,6 +81,22 @@ impl Transmission {
     }
 }
 
+/// What a datagram lost in a probe burst carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BurstKind {
+    Tile,
+    H264,
+    Pad,
+}
+
+/// A loss's place in a probe burst (`TransmissionLedger::probe_burst_class`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BurstClass {
+    /// Departed inside the probe window itself, not only its drain.
+    pub in_window: bool,
+    pub kind: BurstKind,
+}
+
 /// Which rule judged a packet-threshold verdict, with respect to the
 /// reordering window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,7 +344,7 @@ pub struct TransmissionLedger {
     /// The span of a probe burst (its window plus the queue it leaves): a
     /// datagram that departed inside it gets a longer time threshold. See
     /// [`Self::mark_probe_burst`].
-    probe_bursts: VecDeque<(Instant, Instant)>,
+    probe_bursts: VecDeque<(Instant, Instant, Instant)>,
     /// The newest acknowledged departure: its index and when it left. Loss
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
@@ -714,22 +730,31 @@ impl TransmissionLedger {
     /// [`BURST_REORDER_FACTOR`] times the usual threshold. Scoped to the
     /// burst; a datagram outside it, tile or frame, is judged as ever.
     pub fn mark_probe_burst(&mut self, start: Instant, end: Instant) {
+        self.mark_probe_window(start, end, end);
+    }
+
+    /// As [`Self::mark_probe_burst`], and says where the window itself ends
+    /// (`window_end`, at or before `end`, which adds the drain).
+    pub fn mark_probe_window(&mut self, start: Instant, window_end: Instant, end: Instant) {
         if let Some(last) = self.probe_bursts.back_mut() {
-            if start <= last.1 {
+            if start <= last.2 {
                 last.0 = last.0.min(start);
-                last.1 = last.1.max(end);
+                last.1 = last.1.max(window_end);
+                last.2 = last.2.max(end);
                 return;
             }
         }
         if self.probe_bursts.len() >= MAX_PROBE_BURSTS {
             self.probe_bursts.pop_front();
         }
-        self.probe_bursts.push_back((start, end));
+        self.probe_bursts.push_back((start, window_end, end));
     }
 
     /// Whether `at` falls inside a marked probe burst.
     pub fn in_probe_burst(&self, at: Instant) -> bool {
-        self.probe_bursts.iter().any(|&(s, e)| at >= s && at <= e)
+        self.probe_bursts
+            .iter()
+            .any(|&(s, _, e)| at >= s && at <= e)
     }
 
     /// Whether a record is probe material that gets the burst's patience: a
@@ -746,6 +771,29 @@ impl TransmissionLedger {
         self.tombstones
             .get(&wire_seq)
             .is_some_and(|t| t.departed.is_some_and(|d| self.is_patient(&t.tx, d)))
+    }
+
+    /// Where the datagram the verdict on `wire_seq` fell on stood to a marked
+    /// probe burst: `None` outside one, else whether it departed inside the
+    /// window itself (not only the drain after it) and what it carried.
+    pub fn probe_burst_class(&self, wire_seq: u32) -> Option<BurstClass> {
+        let t = self.tombstones.get(&wire_seq)?;
+        let d = t.departed?;
+        let &(_, we, _) = self
+            .probe_bursts
+            .iter()
+            .find(|&&(s, _, e)| d >= s && d <= e)?;
+        let kind = if t.tx.any_content(|c| matches!(c, Content::Pad(_))) {
+            BurstKind::Pad
+        } else if t.tx.any_content(|c| matches!(c, Content::H264Frag { .. })) {
+            BurstKind::H264
+        } else {
+            BurstKind::Tile
+        };
+        Some(BurstClass {
+            in_window: d <= we,
+            kind,
+        })
     }
 
     /// Whether the verdict on `wire_seq` fell on a datagram that departed
