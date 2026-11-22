@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use smallvec::{smallvec, SmallVec};
 
+use crate::transport::admission::QUEUE_BOUND;
 use crate::transport::delivery_sampler::RateMark;
 use crate::transport::reliable_emitter::Content;
 
@@ -318,6 +319,9 @@ struct Record {
 const BURST_REORDER_FACTOR: u32 = 3;
 /// Burst spans kept (a span is a probe window and its drain).
 const MAX_PROBE_BURSTS: usize = 16;
+/// Probe windows remembered. Chained windows merge into one burst but stay
+/// separate here, so a burst can hold several.
+const MAX_PROBE_WINDOWS: usize = 64;
 /// How many patient records the loss scan steps over looking for verdicts
 /// behind them.
 const PATIENT_SCAN_LIMIT: usize = 2048;
@@ -344,7 +348,11 @@ pub struct TransmissionLedger {
     /// The span of a probe burst (its window plus the queue it leaves): a
     /// datagram that departed inside it gets a longer time threshold. See
     /// [`Self::mark_probe_burst`].
-    probe_bursts: VecDeque<(Instant, Instant, Instant)>,
+    probe_bursts: VecDeque<(Instant, Instant)>,
+    /// The probe windows themselves, each with the send queue it left
+    /// ([`QUEUE_BOUND`]). Unlike a burst, two are merged only if they overlap:
+    /// the drain between two chained windows belongs to neither.
+    probe_windows: VecDeque<(Instant, Instant)>,
     /// The newest acknowledged departure: its index and when it left. Loss
     /// is only ever judged against this, never against the clock, so a queue
     /// that delays everything in order cannot produce a verdict (F4).
@@ -402,6 +410,7 @@ impl TransmissionLedger {
             tombstone_order: VecDeque::new(),
             next_dep_idx: 0,
             probe_bursts: VecDeque::new(),
+            probe_windows: VecDeque::new(),
             largest_acked: None,
             largest_acked_at: None,
             largest_acked_arrival: None,
@@ -736,25 +745,37 @@ impl TransmissionLedger {
     /// As [`Self::mark_probe_burst`], and says where the window itself ends
     /// (`window_end`, at or before `end`, which adds the drain).
     pub fn mark_probe_window(&mut self, start: Instant, window_end: Instant, end: Instant) {
-        if let Some(last) = self.probe_bursts.back_mut() {
-            if start <= last.2 {
+        // A datagram admitted late in the window leaves up to a queue bound
+        // after it, when the bottleneck is fullest: still the window's own.
+        let left_by = (window_end + QUEUE_BOUND).min(end.max(window_end));
+        match self.probe_windows.back_mut() {
+            Some(last) if start <= last.1 => {
                 last.0 = last.0.min(start);
-                last.1 = last.1.max(window_end);
-                last.2 = last.2.max(end);
+                last.1 = last.1.max(left_by);
+            }
+            _ => {
+                if self.probe_windows.len() >= MAX_PROBE_WINDOWS {
+                    self.probe_windows.pop_front();
+                }
+                self.probe_windows.push_back((start, left_by));
+            }
+        }
+        if let Some(last) = self.probe_bursts.back_mut() {
+            if start <= last.1 {
+                last.0 = last.0.min(start);
+                last.1 = last.1.max(end);
                 return;
             }
         }
         if self.probe_bursts.len() >= MAX_PROBE_BURSTS {
             self.probe_bursts.pop_front();
         }
-        self.probe_bursts.push_back((start, window_end, end));
+        self.probe_bursts.push_back((start, end));
     }
 
     /// Whether `at` falls inside a marked probe burst.
     pub fn in_probe_burst(&self, at: Instant) -> bool {
-        self.probe_bursts
-            .iter()
-            .any(|&(s, _, e)| at >= s && at <= e)
+        self.probe_bursts.iter().any(|&(s, e)| at >= s && at <= e)
     }
 
     /// Whether a record is probe material that gets the burst's patience: a
@@ -779,10 +800,9 @@ impl TransmissionLedger {
     pub fn probe_burst_class(&self, wire_seq: u32) -> Option<BurstClass> {
         let t = self.tombstones.get(&wire_seq)?;
         let d = t.departed?;
-        let &(_, we, _) = self
-            .probe_bursts
-            .iter()
-            .find(|&&(s, _, e)| d >= s && d <= e)?;
+        if !self.in_probe_burst(d) {
+            return None;
+        }
         let kind = if t.tx.any_content(|c| matches!(c, Content::Pad(_))) {
             BurstKind::Pad
         } else if t.tx.any_content(|c| matches!(c, Content::H264Frag { .. })) {
@@ -791,7 +811,7 @@ impl TransmissionLedger {
             BurstKind::Tile
         };
         Some(BurstClass {
-            in_window: d <= we,
+            in_window: self.probe_windows.iter().any(|&(s, e)| d >= s && d <= e),
             kind,
         })
     }
@@ -821,6 +841,7 @@ impl TransmissionLedger {
         self.tombstone_order.clear();
         self.next_dep_idx = 0;
         self.probe_bursts.clear();
+        self.probe_windows.clear();
         self.largest_acked = None;
         self.largest_acked_at = None;
         self.largest_acked_arrival = None;
@@ -1508,6 +1529,39 @@ mod tests {
                     "and the verdict says it fell in the burst"
                 );
             }
+        }
+    }
+
+    /// Two chained windows merge into one burst, but the drain between them
+    /// belongs to neither; a datagram leaving within a queue bound of a
+    /// window's end is still that window's.
+    #[test]
+    fn the_drain_between_chained_windows_is_not_in_a_window() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        l.mark_probe_window(t0, t0 + 100 * MS, t0 + 400 * MS);
+        l.mark_probe_window(t0 + 250 * MS, t0 + 350 * MS, t0 + 650 * MS);
+        let cases = [
+            (1, 50, true),
+            (2, 110, true),
+            (3, 120, false),
+            (4, 200, false),
+            (5, 300, true),
+        ];
+        for (ws, at, _) in cases {
+            send_content(
+                &mut l,
+                ws,
+                t0 + at * MS,
+                Content::Tile(EmitKey::new(1, 0, 0, ws as u8)),
+            );
+        }
+        send(&mut l, 6, t0 + 301 * MS);
+        assert!(matches!(l.resolve(6), Some(Resolution::Live(_))));
+        assert_eq!(l.detect_losses_at(t0 + 900 * MS, 100 * MS).len(), 5);
+        for (ws, at, in_window) in cases {
+            let c = l.probe_burst_class(ws).expect("inside the merged burst");
+            assert_eq!(c.in_window, in_window, "departed at {at} ms");
         }
     }
 
