@@ -466,14 +466,29 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
             "{n}: admission never held work back under loss"
         );
         // What the client's LOSS_REPORT counted reaches goog_cc, and what it
-        // did not (a phantom) does not: every declared loss is either
-        // confirmed, or still held, or was dropped unconfirmed; the flush is
-        // the confirmed ones less the probe-burst ones.
+        // did not (a phantom) does not. The property: the losses confirmed are
+        // bounded by the gaps the client reported (`lost_pre_fec`, summed), and
+        // the flush by the confirmed. These scenes have a clean ack path, so
+        // the ledger declares few losses the client did not count; the stall
+        // scene below (`an_ack_stall_makes_phantom_losses_the_confirmer_holds_back`)
+        // is the one that fails a confirmer that releases every verdict at once.
         let confirmed: u64 = i.ledger_loss_class_confirmed.iter().sum();
+        let unconfirmed: u64 = i.ledger_loss_class_unconfirmed.iter().sum();
+        let reported = r.transport.report_lost_pre_fec_total;
+        eprintln!(
+            "{n}: declared {} confirmed {confirmed} unconfirmed {unconfirmed} \
+             flushed {} reported gaps {reported}",
+            i.ledger_losses_declared, i.ledger_losses_flushed
+        );
         assert!(i.ledger_losses_flushed > 0, "{n}: no loss reached goog_cc");
         assert!(
-            confirmed >= i.ledger_losses_flushed,
-            "{n}: flushed more than the client confirmed"
+            i.ledger_losses_flushed <= confirmed,
+            "{n}: flushed {} more than the client confirmed {confirmed}",
+            i.ledger_losses_flushed
+        );
+        assert!(
+            confirmed <= reported,
+            "{n}: confirmed {confirmed} losses against {reported} gaps the client reported"
         );
         assert!(
             i.ledger_losses_flushed + i.ledger_losses_overflowed <= i.ledger_losses_declared,
@@ -732,6 +747,52 @@ async fn burst_loss_report_over_three_seeds() {
             );
             assert_established(&name, r);
         }
+    }
+}
+
+/// An acknowledgement stall under 2 % loss: the server's ledger declares
+/// losses for datagrams the client holds (phantoms), whose acknowledgements
+/// were dropped. The client's LOSS_REPORTs count none of those, so the
+/// confirmer must hold them back and drop them as unconfirmed, and what
+/// reaches goog_cc stays within the gaps the client reported.
+#[tokio::test(start_paused = true)]
+async fn an_ack_stall_makes_phantom_losses_the_confirmer_holds_back() {
+    for seed in [0xa57a_0001u64, 0xa57a_0002] {
+        let n = format!("ack stall seed {seed:x}");
+        let opts = RunOptions {
+            ack_blackout: Some((Duration::from_millis(3_000), Duration::from_millis(4_500))),
+            ..RunOptions::default()
+        };
+        let r = run_browserless_with_options(scene(seed, 14), s2c_only(|p| p.loss = RATE), opts)
+            .await
+            .expect("scene ran");
+        assert_established(&n, &r);
+        let i = &r.transport.instr;
+        let confirmed: u64 = i.ledger_loss_class_confirmed.iter().sum();
+        let unconfirmed: u64 = i.ledger_loss_class_unconfirmed.iter().sum();
+        let reported = r.transport.report_lost_pre_fec_total;
+        eprintln!(
+            "{n}: declared {} confirmed {confirmed} unconfirmed {unconfirmed} flushed {} reported gaps {reported}",
+            i.ledger_losses_declared, i.ledger_losses_flushed
+        );
+        assert!(
+            unconfirmed > 0,
+            "{n}: the stall produced no phantom the confirmer dropped (declared {})",
+            i.ledger_losses_declared
+        );
+        assert!(
+            confirmed <= reported,
+            "{n}: confirmed {confirmed} losses against {reported} gaps the client reported"
+        );
+        assert!(
+            confirmed < i.ledger_losses_declared,
+            "{n}: every declared loss ({}) was confirmed",
+            i.ledger_losses_declared
+        );
+        assert!(
+            i.ledger_losses_flushed <= confirmed,
+            "{n}: flushed beyond confirmed"
+        );
     }
 }
 
