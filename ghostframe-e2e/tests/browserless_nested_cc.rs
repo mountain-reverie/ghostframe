@@ -69,6 +69,10 @@ enum Queue {
     /// A shallow buffer: it overflows at a standing queue of 25 ms, so a
     /// sender above the link rate loses packets to it within a few frames.
     DropTail25,
+    /// Shallower still: at 5 or 10 ms the sender's own bursts overflow it
+    /// below the link rate, so a steady loss of a few percent is the buffer's.
+    DropTail10,
+    DropTail5,
     CoDel,
 }
 
@@ -80,6 +84,14 @@ fn bottleneck(q: Queue) -> Bottleneck {
         },
         Queue::DropTail25 => Bottleneck {
             depth_ms: 25,
+            aqm: None,
+        },
+        Queue::DropTail10 => Bottleneck {
+            depth_ms: 10,
+            aqm: None,
+        },
+        Queue::DropTail5 => Bottleneck {
+            depth_ms: 5,
             aqm: None,
         },
         Queue::CoDel => Bottleneck {
@@ -834,40 +846,64 @@ impl Drop for GuardReset {
 /// client's confirmation may pin a loss on the wrong sending rate.
 ///
 /// The sender's rate is the estimator's, so the loss cannot be set directly.
-/// The scene starts it at a link of 10 Mbit/s with the estimate settled near
-/// it and steps the link down by 2, 3.5 and 5 %: a sender that stays where it
-/// was loses that share to the 25 ms buffer. What the estimate does next is
-/// the measurement: `loss_pct_first10s` says whether the sender was in the
-/// regime, `loss_pct_settled` and `settled_over_cap` whether it stayed.
-/// Three seeds per cell, and each arm runs all the cells before the other.
+/// Two ways to put the sender in the regime, and the scene reports whether it
+/// got there (`loss_pct_settled`) rather than assuming it:
 ///
-/// Run on demand (about 10 minutes):
+/// * `step`: a 25 ms buffer behind a 10 Mbit/s link that steps down by 2, 3.5
+///   or 5 % at 10 s. A sender that stays where it was loses that share.
+/// * `shallow`: a constant 10 Mbit/s link behind a 10 or 5 ms buffer, which the
+///   sender's own bursts overflow below the link rate.
+///
+/// Per run: the loss in the 10 s after the step (step cells), the loss over the
+/// last 20 s, the settled estimate over the link (the post-step link for step
+/// cells) and the settled queue delay. Three seeds per cell; each arm runs all
+/// the cells before the other. Loss is `window_loss_pct`, an approximation.
+///
+/// Run on demand (about 15 minutes):
 /// `cargo test --release --test browserless_nested_cc s4c -- --ignored --nocapture --test-threads=1`
 #[tokio::test(start_paused = true)]
-#[ignore = "report-only comparison, ~10 min; run on demand"]
+#[ignore = "report-only comparison, ~15 min; run on demand"]
 async fn s4c_shallow_droptail_steady_congestion_loss_guard_off_vs_on() {
     const HIGH: u64 = 10;
     const STEP_AT: u64 = 10 * S;
-    const END: u64 = 50 * S;
     let _reset = GuardReset;
+    // (cell, queue, link before the step, step time, link after, seconds)
+    let mut cells: Vec<(String, Queue, u64, Option<u64>, f64, u64)> = Vec::new();
+    for step_pct in [2.0f64, 3.5, 5.0] {
+        let low_bps = HIGH as f64 * 1e6 * (1.0 - step_pct / 100.0);
+        cells.push((
+            format!("step{step_pct}pct"),
+            Queue::DropTail25,
+            HIGH * MBIT,
+            Some(STEP_AT),
+            low_bps,
+            50,
+        ));
+    }
+    for (n, q) in [
+        ("shallow10ms", Queue::DropTail10),
+        ("shallow5ms", Queue::DropTail5),
+    ] {
+        cells.push((n.to_string(), q, HIGH * MBIT, None, HIGH as f64 * 1e6, 40));
+    }
     for guard_on in [false, true] {
         ghostframe_lib::transport::bwe::set_inherent_loss_guard(guard_on);
         let arm = if guard_on { "guard_on" } else { "guard_off" };
-        for step_pct in [2.0f64, 3.5, 5.0] {
-            let low_bps = HIGH as f64 * 1e6 * (1.0 - step_pct / 100.0);
+        for (cell, q, high, step_at, cap_bps, secs) in &cells {
             for (i, seed) in [0xCC04_0021u64, 0xCC04_0022, 0xCC04_0023]
                 .into_iter()
                 .enumerate()
             {
-                let name = format!("s4c_{arm}_step{step_pct}pct_seed{}", i + 1);
-                let cap = CapTimeline {
-                    points: vec![(0, HIGH * MBIT), (STEP_AT, (low_bps / 8.0) as u64)],
+                let name = format!("s4c_{arm}_{cell}_seed{}", i + 1);
+                let points = match step_at {
+                    Some(at) => vec![(0, *high), (*at, (cap_bps / 8.0) as u64)],
+                    None => vec![(0, *high)],
                 };
                 let r = run(
                     seed,
-                    cap,
-                    Queue::DropTail25,
-                    END / S,
+                    CapTimeline { points },
+                    *q,
+                    *secs,
                     &[],
                     OVERDRIVE * HIGH as f64,
                 )
@@ -880,11 +916,13 @@ async fn s4c_shallow_droptail_steady_congestion_loss_guard_off_vs_on() {
                 let end = r.bwe_estimate_samples.last().unwrap().0 + 1;
                 let from = end.saturating_sub(20 * S);
                 let pct = |v: Option<f64>| v.map_or("none".to_string(), |x| format!("{x:.2}"));
-                metric(
-                    &name,
-                    "loss_pct_first10s",
-                    pct(window_loss_pct(&r, STEP_AT, STEP_AT + 10 * S)),
-                );
+                if let Some(at) = step_at {
+                    metric(
+                        &name,
+                        "loss_pct_first10s",
+                        pct(window_loss_pct(&r, *at, at + 10 * S)),
+                    );
+                }
                 metric(
                     &name,
                     "loss_pct_settled",
@@ -895,7 +933,7 @@ async fn s4c_shallow_droptail_steady_congestion_loss_guard_off_vs_on() {
                     metric(
                         &name,
                         "settled_over_cap",
-                        format!("{:.3}", m as f64 / low_bps),
+                        format!("{:.3}", m as f64 / cap_bps),
                     );
                 }
                 metric(
