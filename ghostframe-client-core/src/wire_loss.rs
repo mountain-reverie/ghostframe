@@ -21,8 +21,10 @@ const RING: usize = 512;
 ///
 /// Within one `ClientCore` that does not happen: the server restarts its
 /// counters only for a new connection, which is a new core. So a large jump is
-/// a blackout, and it must be counted (a 0.4 s outage at 100 Mbit/s is about
-/// 4000 datagrams). The bound only stops an implausible value, a corrupt or
+/// a blackout, and it must be counted. The sender stops at its congestion
+/// window, so a blackout's gap is about one window however long it lasts; it
+/// passes 4096 only with a large bandwidth-delay product (about 200 ms at
+/// 100 Mbit/s). The bound only stops an implausible value, a corrupt or
 /// hostile one, from being read as a loss of billions; 2^20 is about 100 s at
 /// 10 000 datagrams/s.
 const RESYNC_JUMP: u32 = 1 << 20;
@@ -286,6 +288,27 @@ mod tests {
     #[test]
     fn an_implausible_jump_is_a_resync() {
         assert_eq!(jumped(99, RESYNC_JUMP + 1).lost_pre_fec, 0);
+        // The largest jump still read as a blackout. Without it the line above
+        // holds for a resync bound of any size.
+        assert_eq!(
+            jumped(99, RESYNC_JUMP).lost_pre_fec,
+            (RESYNC_JUMP - 1) as u64
+        );
+    }
+
+    #[test]
+    fn a_jump_across_the_u32_wrap_is_counted_exactly() {
+        let mut t = WireLossTracker::new();
+        let start = u32::MAX - 200;
+        for i in 0..100 {
+            t.on_received(start.wrapping_add(i));
+        }
+        let to = start.wrapping_add(99).wrapping_add(1000);
+        for i in 0..300 {
+            t.on_received(to.wrapping_add(i));
+        }
+        let s = t.stats();
+        assert_eq!((s.lost_pre_fec, s.received), (999, 400));
     }
 
     #[test]
