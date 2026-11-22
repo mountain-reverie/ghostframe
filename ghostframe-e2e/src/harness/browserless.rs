@@ -1277,6 +1277,14 @@ async fn run_inner(
     let transport = *transport_probe_cell
         .lock()
         .expect("transport_probe_publish mutex poisoned");
+    // Which losses goog_cc was told of, by class [queue, local, path].
+    println!(
+        "LOSSCLASS declared={} flushed={} confirmed={:?} unconfirmed={:?}",
+        transport.instr.ledger_losses_declared,
+        transport.instr.ledger_losses_flushed,
+        transport.instr.ledger_loss_class_confirmed,
+        transport.instr.ledger_loss_class_unconfirmed,
+    );
     let send_datagram_errs = *send_errs_cell.lock().expect("send_errs mutex poisoned");
     let tiles_with_pass0_sent = pass0_cell.lock().unwrap().len();
     let (probes_completed, probes_abandoned) = *probe_stats_cell

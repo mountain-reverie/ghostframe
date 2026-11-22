@@ -102,6 +102,9 @@ impl IoBridge {
         match LossReport::decode(dg) {
             Ok(r) => {
                 self.fec_in.loss_reports_rx += 1;
+                // The receiver's own count of what it never got: the only
+                // loss goog_cc is told of (`fec_tx::loss_confirm`), in every mode.
+                self.confirm_losses_from_report(r.last_bundle_seq, r.lost_pre_fec);
                 let p = &mut self.transport_probe;
                 p.loss_reports += 1;
                 p.report_lost_pre_fec = r.lost_pre_fec;

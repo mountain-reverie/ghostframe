@@ -1019,8 +1019,12 @@ pub struct IoBridge {
     /// `*_publish` cells.
     #[cfg(any(test, feature = "browserless-harness"))]
     transport_probe_publish: std::sync::Arc<std::sync::Mutex<TransportProbe>>,
-    /// Losses awaiting a feedback report with at least one acknowledgement to
-    /// travel in. See the drain site.
+    /// Losses the ledger declared, held until the client's LOSS_REPORT counts
+    /// a gap for them (`fec_tx::loss_confirm`). A stall's phantom losses are
+    /// never confirmed, so never reach goog_cc.
+    loss_confirm: crate::transport::fec_tx::loss_confirm::LossConfirmer<PendingLoss>,
+    /// Confirmed losses awaiting a feedback report with at least one
+    /// acknowledgement to travel in. See the drain site.
     pending_losses: Vec<PendingLoss>,
     /// `wire_seq`s acknowledged late this turn while a loss was pending;
     /// drained by `retract_late_acked_losses`.
@@ -1662,6 +1666,7 @@ impl IoBridge {
             transport_probe_publish: std::sync::Arc::new(std::sync::Mutex::new(
                 TransportProbe::default(),
             )),
+            loss_confirm: Default::default(),
             pending_losses: Vec::new(),
             late_acked: std::collections::HashSet::new(),
             pending_losses_retracted: 0,
@@ -2721,6 +2726,7 @@ impl IoBridge {
         // the ACK-receive path in Task 5) into the estimator. Cheap
         // on empty.
         self.retract_late_acked_losses();
+        self.expire_unconfirmed_losses();
         // Reported only alongside an acknowledgement: goog_cc unwraps the
         // max receive time over a report's received packets, so a
         // loss-only report panics inside the library. A congested link can

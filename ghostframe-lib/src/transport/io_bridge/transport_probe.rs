@@ -154,6 +154,11 @@ pub(super) struct Instruments {
     /// Declared lost, departed inside a probe burst, and so not reported to
     /// goog_cc.
     pub(super) losses_probe_burst: u64,
+    /// By class (queue, local, path): confirmed by a LOSS_REPORT gap, and so
+    /// let through to goog_cc (before the probe-burst filter), and unconfirmed
+    /// when their wait ran out (phantoms: the client had the datagram).
+    pub(super) loss_class_confirmed: [u64; 3],
+    pub(super) loss_class_unconfirmed: [u64; 3],
     /// Declared lost but dropped from the pending list by its cap.
     pub(super) losses_overflowed: u64,
     pub(super) flushed: crate::transport::instruments::FlushedLosses,
@@ -224,6 +229,7 @@ impl IoBridge {
         // acknowledgement, and the late-ack marks that name the old session's
         // wire_seqs.
         self.pending_losses.clear();
+        self.loss_confirm.reset_session();
         self.late_acked.clear();
         self.instr.flushed = Default::default();
         // The sampler's `delivered` and ordinals belong to the session that
@@ -570,6 +576,8 @@ impl IoBridge {
             admission: i.admission,
             ledger_losses_declared: i.losses_declared,
             ledger_losses_flushed: i.losses_flushed,
+            ledger_loss_class_confirmed: i.loss_class_confirmed,
+            ledger_loss_class_unconfirmed: i.loss_class_unconfirmed,
             ledger_losses_overflowed: i.losses_overflowed,
             late_acked_before_flush: self.pending_losses_retracted,
             late_acked_after_flush: i.late_acked_after_flush,

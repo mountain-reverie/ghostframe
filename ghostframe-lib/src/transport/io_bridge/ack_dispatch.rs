@@ -264,7 +264,8 @@ impl IoBridge {
                         self.loss_window
                             .record(tx.emit_us as u32, false, tx.records.len() as u32);
                         self.recent_bundles.remember(id, &tx);
-                        if let (Some(dep_us), true) = (tx.depart_us, self.fec_adapt.is_some()) {
+                        // Whatever the FEC mode: the estimator's loss filter reads it too.
+                        if let Some(dep_us) = tx.depart_us {
                             let now_ms = self.bwe_ms(now_for_samples);
                             self.queue_loss
                                 .on_ack(id, arrival_lo16, dep_us / 1000, now_ms);
@@ -301,6 +302,8 @@ impl IoBridge {
                         if was_flushed {
                             self.instr.late_acked_after_flush += 1;
                         }
+                        // Not lost, so there is nothing for a report to confirm.
+                        self.loss_confirm.withdraw(id);
                         // Withdrawn from `pending_losses` once per turn
                         // (see `retract_late_acked_losses`); only worth
                         // noting when something is waiting there.

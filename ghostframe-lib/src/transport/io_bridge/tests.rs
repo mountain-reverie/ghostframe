@@ -5798,6 +5798,7 @@ async fn a_late_ack_retracts_the_pending_loss_it_contradicts() {
         .transmission_ledger
         .record_departed(42, t0, ledger_tx(2_000, 900, 2));
     bridge.declare_lost_for_test(&[41, 42]);
+    bridge.dispatch_loss_report_datagram(&loss_report(42, 2));
     assert_eq!(bridge.pending_losses.len(), 2, "both declared lost");
 
     // Only wire_seq 41 turns out to have arrived.
@@ -5833,6 +5834,7 @@ async fn a_late_ack_withdraws_its_own_loss_among_identical_twins() {
             .record_departed(ws, t0, ledger_tx(5_000, 1_200, ws));
     }
     bridge.declare_lost_for_test(&[10, 11, 12]);
+    bridge.dispatch_loss_report_datagram(&loss_report(12, 3));
     let batch = AckBatch {
         entries: vec![AckEntry {
             wire_seq: 11,
@@ -5859,6 +5861,7 @@ async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
         .transmission_ledger
         .record_departed(2, t0, ledger_tx(2_000, 1_200, 2));
     bridge.declare_lost_for_test(&[1, 2]);
+    bridge.dispatch_loss_report_datagram(&loss_report(2, 2));
     bridge.pending_losses.retain(|l| l.wire_seq != 1); // wire_seq 1 was flushed
     let batch = AckBatch {
         entries: vec![AckEntry {
@@ -5891,6 +5894,7 @@ async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
         .transmission_ledger
         .record_departed(42, long_ago, ledger_tx(2_000, 900, 2));
     bridge.declare_lost_for_test(&[41, 42]);
+    bridge.dispatch_loss_report_datagram(&loss_report(42, 2));
 
     bridge.post_turn().await.expect("post_turn");
     assert_eq!(
@@ -5934,14 +5938,17 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
     let long_ago = super::now_std()
         .checked_sub(std::time::Duration::from_secs(60))
         .expect("monotonic clock has 60 s of history");
-    for ws in [1, 2] {
+    for ws in [41, 42] {
         bridge.transmission_ledger.record_departed(
             ws,
             long_ago,
             ledger_tx(1_000 * ws as u64, 1_200, ws),
         );
     }
-    bridge.declare_lost_for_test(&[1, 2]);
+    bridge.declare_lost_for_test(&[41, 42]);
+    assert!(bridge.pending_losses.is_empty(), "held until a report");
+    // The client counts both as gaps.
+    bridge.dispatch_loss_report_datagram(&loss_report(42, 2));
     bridge.post_turn().await.expect("post_turn");
     assert_eq!(bridge.pending_losses.len(), 2, "declared, not yet reported");
     assert_eq!(bridge.instr.losses_declared, 2);
@@ -5950,14 +5957,14 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
     // A live acknowledgement gives goog_cc a report to carry the losses.
     bridge
         .transmission_ledger
-        .record_departed(3, super::now_std(), ledger_tx(3_000, 1_200, 3));
-    bridge.dispatch_ack_v4_datagram(&ack(3));
+        .record_departed(43, super::now_std(), ledger_tx(43_000, 1_200, 43));
+    bridge.dispatch_ack_v4_datagram(&ack(43));
     bridge.post_turn().await.expect("post_turn");
     assert!(bridge.pending_losses.is_empty(), "flushed to goog_cc");
     assert_eq!(bridge.instr.losses_flushed, 2);
 
     // Now the first "lost" transmission turns out to have arrived.
-    bridge.dispatch_ack_v4_datagram(&ack(1));
+    bridge.dispatch_ack_v4_datagram(&ack(41));
     bridge.post_turn().await.expect("post_turn");
     let s = bridge.instrument_summary();
     assert_eq!(
@@ -5968,6 +5975,100 @@ async fn a_late_ack_after_the_flush_is_counted_apart_from_one_before_it() {
         ),
         (1, 0, 0)
     );
+}
+
+/// A loss still waiting for its report, acknowledged late, is withdrawn: a
+/// report that then counts a gap confirms the other one, not the arrived one.
+#[tokio::test]
+async fn a_late_ack_withdraws_a_loss_still_awaiting_its_report() {
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let t0 = super::now_std();
+    for ws in [10, 11] {
+        bridge
+            .transmission_ledger
+            .record_departed(ws, t0, ledger_tx(5_000, 1_200, ws));
+    }
+    bridge.declare_lost_for_test(&[10, 11]);
+    assert_eq!(bridge.loss_confirm.held_len(), 2);
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 10,
+            arrival_time_ms_lo16: 1,
+        }],
+    };
+    bridge.dispatch_ack_v4_datagram(&batch.encode());
+    assert_eq!(bridge.loss_confirm.held_len(), 1, "10 arrived: not lost");
+    bridge.dispatch_loss_report_datagram(&loss_report(11, 1));
+    let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
+    assert_eq!(left, vec![11]);
+}
+
+/// A LOSS_REPORT reaching `last` that counts `gaps` gaps.
+fn loss_report(last: u32, gaps: u16) -> Vec<u8> {
+    ghostframe_protocol::fec::feedback::LossReport {
+        last_bundle_seq: last,
+        lost_pre_fec: gaps,
+        ..Default::default()
+    }
+    .encode()
+}
+
+/// goog_cc is told of the losses the client's LOSS_REPORT counted and of no
+/// others: a stall's phantoms (declared lost, the client has them) are held,
+/// never confirmed, and dropped when their wait runs out.
+#[tokio::test]
+async fn only_a_loss_the_client_confirmed_reaches_goog_cc() {
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let long_ago = super::now_std()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("monotonic clock has 60 s of history");
+    // Ten verdicts at once, as a stalled ack path makes.
+    for ws in 20..30u32 {
+        bridge.transmission_ledger.record_departed(
+            ws,
+            long_ago,
+            ledger_tx(1_000 * u64::from(ws), 1_200, ws),
+        );
+    }
+    let all: Vec<u32> = (20..30).collect();
+    bridge.declare_lost_for_test(&all);
+    let live_ack = |bridge: &mut IoBridge| {
+        bridge.transmission_ledger.record_departed(
+            40,
+            super::now_std(),
+            ledger_tx(40_000, 1_200, 40),
+        );
+        let ack = AckBatch {
+            entries: vec![AckEntry {
+                wire_seq: 40,
+                arrival_time_ms_lo16: 7,
+            }],
+        }
+        .encode();
+        bridge.dispatch_ack_v4_datagram(&ack);
+    };
+    // A report with no gaps: the client has all ten. Nothing is confirmed.
+    bridge.dispatch_loss_report_datagram(&loss_report(35, 0));
+    live_ack(&mut bridge);
+    bridge.post_turn().await.expect("post_turn");
+    assert_eq!(bridge.instr.losses_declared, 10);
+    assert_eq!(bridge.instr.losses_flushed, 0, "phantoms are not reported");
+    assert_eq!(bridge.loss_confirm.held_len(), 10);
+    // A report that counts two: exactly two are reported, the rest stay held.
+    bridge.dispatch_loss_report_datagram(&loss_report(35, 2));
+    live_ack(&mut bridge);
+    bridge.post_turn().await.expect("post_turn");
+    assert_eq!(bridge.instr.losses_flushed, 2);
+    assert_eq!(bridge.instr.loss_class_confirmed.iter().sum::<u64>(), 2);
+    assert_eq!(bridge.loss_confirm.held_len(), 8);
+    // Nobody confirms the rest: they are counted as unconfirmed, not reported.
+    for l in bridge.loss_confirm.expire(u64::MAX / 2) {
+        bridge.instr.loss_class_unconfirmed[l.class.counter_index()] += 1;
+    }
+    assert_eq!(bridge.instr.loss_class_unconfirmed.iter().sum::<u64>(), 8);
+    assert_eq!(bridge.instr.losses_flushed, 2);
 }
 
 /// A sealed bundle that carries no record (a lone control frame) of `len` bytes.
@@ -6111,6 +6212,7 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
         );
     }
     bridge.declare_lost_for_test(&[first_ws]);
+    bridge.dispatch_loss_report_datagram(&loss_report(first_ws, 1));
     assert_eq!(bridge.pending_losses.len(), 1);
     let true_us = now.duration_since(base).as_micros() as u64;
     assert!(
@@ -6781,6 +6883,9 @@ async fn a_queued_transmission_is_not_declared_lost_and_a_departed_one_is_report
     }
     assert!(bridge.transmission_ledger.resolve(46).is_some());
     bridge.post_turn().await.expect("post_turn");
+    // The client counts every gap it is asked about: whatever was declared is
+    // let through, so the check below sees all of it.
+    bridge.dispatch_loss_report_datagram(&loss_report(60, 100));
     assert!(
         bridge.pending_losses.iter().all(|l| l.wire_seq != 41),
         "a transmission still queued cannot have been lost"
@@ -6795,6 +6900,7 @@ async fn a_queued_transmission_is_not_declared_lost_and_a_departed_one_is_report
     let left = base + std::time::Duration::from_millis(5);
     bridge.stamp_departure(41, left);
     bridge.declare_lost_for_test(&[41]);
+    bridge.dispatch_loss_report_datagram(&loss_report(41, 1));
     assert_eq!(bridge.pending_losses.len(), 1);
     assert_eq!(
         bridge.pending_losses[0].emit_us, 5_000,
@@ -7083,6 +7189,7 @@ async fn a_spurious_verdict_is_retracted_and_its_round_trip_is_not_a_sample() {
         ledger_tx(bridge.reliable_emitter.emit_us64(now), 1_200, 7),
     );
     bridge.declare_lost_for_test(&[7]);
+    bridge.dispatch_loss_report_datagram(&loss_report(7, 1));
     assert_eq!(bridge.pending_losses.len(), 1, "premise: declared lost");
     // The path was silent: the probe backoff is up.
     bridge.reliable_emitter.note_pto_fire(now);
@@ -7209,6 +7316,7 @@ async fn the_loss_time_of_a_hole_is_a_wake_deadline() {
     assert_eq!(bridge.next_wake_deadline(), Some(now + thr));
     tokio::time::advance(thr).await;
     bridge.expire_transmissions(super::now_std());
+    bridge.dispatch_loss_report_datagram(&loss_report(2, 1));
     assert_eq!(bridge.pending_losses.len(), 1, "declared at the loss time");
     assert_eq!(bridge.transmission_ledger.stats().lost_time_threshold, 1);
 }

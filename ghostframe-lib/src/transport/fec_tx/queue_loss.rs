@@ -129,13 +129,13 @@ pub struct QueueLossStats {
 
 /// Unwraps `u32` sequence numbers against the newest one acknowledged.
 #[derive(Debug, Default, Clone, Copy)]
-struct SeqUnwrap {
+pub(super) struct SeqUnwrap {
     anchor: Option<i64>,
 }
 
 impl SeqUnwrap {
     /// `seq` as an `i64` on the anchor's line (within 2^31 of it).
-    fn at(&self, seq: u32) -> i64 {
+    pub(super) fn at(&self, seq: u32) -> i64 {
         match self.anchor {
             None => i64::from(seq),
             Some(a) => a + i64::from(seq.wrapping_sub(a as u32) as i32),
@@ -143,7 +143,7 @@ impl SeqUnwrap {
     }
 
     /// As [`Self::at`], moving the anchor up to it.
-    fn advance(&mut self, seq: u32) -> i64 {
+    pub(super) fn advance(&mut self, seq: u32) -> i64 {
         let u = self.at(seq);
         if self.anchor.is_none_or(|a| u > a) {
             self.anchor = Some(u);
@@ -323,6 +323,35 @@ impl QueueLossClassifier {
         }
     }
 
+    /// What `on_verdict` would class `seq` as, without touching any state:
+    /// no credit is issued, a local mark is not consumed, and the counters do
+    /// not move. Source-carrying or not, the question is the same (is it a
+    /// loss the stream's own queue or quinn's own discard explains), which is
+    /// what the bandwidth estimator is asked. The threshold reads only the
+    /// window's entries still in date at `now_ms`.
+    pub(crate) fn peek_class(&self, seq: u32, now_ms: u64) -> LossClass {
+        let u = self.seq.at(seq);
+        if self.local.contains(&u) {
+            return LossClass::Local;
+        }
+        let q_max = self
+            .peak
+            .iter()
+            .find(|&&(t, _)| t + WINDOW_MS >= now_ms)
+            .map_or(0, |&(_, q)| q);
+        let threshold = Q_FLOOR_MS.max((Q_FRACTION * f64::from(q_max)) as i32);
+        if self
+            .q
+            .range(..u)
+            .next_back()
+            .is_some_and(|(_, &q)| q >= threshold)
+        {
+            LossClass::Queue
+        } else {
+            LossClass::Path
+        }
+    }
+
     /// The ledger judged `seq` lost. `has_records` is whether it carried
     /// source content. A queue or local loss earns a report a credit.
     pub(crate) fn on_verdict(&mut self, seq: u32, has_records: bool, now_ms: u64) -> LossClass {
@@ -495,6 +524,39 @@ mod tests {
             c.on_verdict(0, true, 1_300),
             LossClass::Path,
             "no neighbour"
+        );
+    }
+
+    #[test]
+    fn peek_class_agrees_with_the_verdict_and_changes_nothing() {
+        let mut c = QueueLossClassifier::default();
+        ack(&mut c, 0, 0, 1_000);
+        ack(&mut c, 10, 120, 1_100);
+        ack(&mut c, 20, 0, 1_200);
+        c.on_local_discard(&[30], 1);
+        let before = (c.stats(), c.credit_len());
+        for (seq, want) in [
+            (15, LossClass::Queue),
+            (25, LossClass::Path),
+            (0, LossClass::Path),
+            (30, LossClass::Local),
+        ] {
+            assert_eq!(c.peek_class(seq, 1_300), want, "peek {seq}");
+        }
+        assert_eq!(before, (c.stats(), c.credit_len()), "a peek is read-only");
+        // The local mark survives the peek, so the verdict still sees it.
+        assert_eq!(c.on_verdict(30, true, 1_300), LossClass::Local);
+        // A peak out of the window no longer raises the threshold.
+        assert_eq!(c.peek_class(15, 1_100 + WINDOW_MS + 1), LossClass::Queue);
+        let mut d = QueueLossClassifier::default();
+        ack(&mut d, 0, 0, 1_000);
+        ack(&mut d, 10, 400, 1_100);
+        ack(&mut d, 20, 100, 1_200);
+        assert_eq!(d.peek_class(25, 1_300), LossClass::Path, "100 < 0.8 x 400");
+        assert_eq!(
+            d.peek_class(25, 1_100 + WINDOW_MS + 1),
+            LossClass::Queue,
+            "the 400 ms peak aged out"
         );
     }
 

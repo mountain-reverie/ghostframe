@@ -2512,6 +2512,10 @@ impl IoBridge {
                 bytes_per_us = self.adaptation_context.bytes_per_us,
                 smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
                 pending_losses_retracted = self.pending_losses_retracted,
+                // Held (declared lost, no LOSS_REPORT gap yet), confirmed, dropped
+                // unconfirmed, withdrawn by a late ack, and gaps no verdict took.
+                loss_confirm_held = self.loss_confirm.held_len(),
+                loss_confirm = ?self.loss_confirm.stats(),
                 // D1 instruments (measurement only; see `transport::instruments`).
                 // The offered-load, FIFO, departure-lag and quinn byte fields
                 // cover the LIVE SESSION only (reset when another connection
@@ -2568,6 +2572,8 @@ impl IoBridge {
                 admit_short_bundle_shared_risk = ins.admission.short_bundle_shared_risk,
                 ledger_losses_declared = ins.ledger_losses_declared,
                 ledger_losses_flushed = ins.ledger_losses_flushed,
+                loss_class_confirmed = ?ins.ledger_loss_class_confirmed,
+                loss_class_unconfirmed = ?ins.ledger_loss_class_unconfirmed,
                 ledger_losses_overflowed = ins.ledger_losses_overflowed,
                 late_acked_before_flush = ins.late_acked_before_flush,
                 late_acked_after_flush = ins.late_acked_after_flush,
