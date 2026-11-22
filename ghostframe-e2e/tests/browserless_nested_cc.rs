@@ -66,6 +66,9 @@ const OVERDRIVE: f64 = 1.3;
 #[derive(Clone, Copy)]
 enum Queue {
     DropTail100,
+    /// A shallow buffer: it overflows at a standing queue of 25 ms, so a
+    /// sender above the link rate loses packets to it within a few frames.
+    DropTail25,
     CoDel,
 }
 
@@ -73,6 +76,10 @@ fn bottleneck(q: Queue) -> Bottleneck {
     match q {
         Queue::DropTail100 => Bottleneck {
             depth_ms: 100,
+            aqm: None,
+        },
+        Queue::DropTail25 => Bottleneck {
+            depth_ms: 25,
             aqm: None,
         },
         Queue::CoDel => Bottleneck {
@@ -621,6 +628,146 @@ async fn s3_probe_under_load_capacity_steps() {
         report_delivery(name, label, &r, cap, from, to);
     }
     report_context(name, &r, high, DOWN_AT - 5 * S, DOWN_AT);
+}
+
+/// The p95 of the queue wait of the datagrams offered in `[from_us, to_us)`,
+/// ms: their transit time less the link's propagation delay (10 ms here).
+fn queue_delay_p95_ms(r: &BrowserlessResult, from_us: u64, to_us: u64) -> Option<u64> {
+    let mut v: Vec<u64> = r
+        .s2c_transit_samples
+        .iter()
+        .filter(|(t, _)| *t >= from_us && *t < to_us)
+        .map(|(_, d)| d.saturating_sub(10_000))
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    Some(v[(v.len() * 95 / 100).min(v.len() - 1)] / 1000)
+}
+
+/// What a loss-aware estimator is for: a shallow tail-drop buffer whose
+/// overflow is the congestion signal. Report-only for now. Per seed: the loss
+/// the link inflicted, the queue it left, where the estimate settled against
+/// the cap, and how long it took after a capacity step.
+fn shallow_report(name: &str, r: &BrowserlessResult, cap_bps: f64, step_us: u64, end_us: u64) {
+    let s = &r.bwe_estimate_samples;
+    let settle_from = end_us.saturating_sub(8 * S);
+    metric(name, "bytes_dropped", r.bytes_dropped);
+    metric(
+        name,
+        "loss_rate_pct",
+        format!(
+            "{:.2}",
+            100.0 * r.s2c_datagrams_dropped as f64 / r.s2c_datagrams_offered.max(1) as f64
+        ),
+    );
+    metric(
+        name,
+        "queue_delay_p95_ms_whole_run",
+        fmt_opt(queue_delay_p95_ms(r, 0, end_us)),
+    );
+    metric(
+        name,
+        "queue_delay_p95_ms_settled",
+        fmt_opt(queue_delay_p95_ms(r, settle_from, end_us)),
+    );
+    metric(name, "final_est_bps", r.bwe_estimate_bps);
+    if let Some(m) = cc::median_bps(s, settle_from, end_us) {
+        metric(name, "settled_median_bps", m);
+        metric(
+            name,
+            "settled_over_cap",
+            format!("{:.3}", m as f64 / cap_bps),
+        );
+    }
+    metric(
+        name,
+        "t_settle_after_step_ms",
+        ms(cc::convergence_time(
+            s,
+            step_us,
+            end_us,
+            cap_bps,
+            BAND,
+            3 * S,
+        )),
+    );
+    metric(name, "bytes_s2c", r.bytes_delivered_s2c);
+    metric(name, "retransmit_attempts", r.retransmit_attempts_total);
+}
+
+/// S4a: a 25 ms tail-drop buffer and a capacity step from 15 down to 5 Mbit/s
+/// held for 20 s, offered load above the high rate throughout. Three seeds.
+/// Gate: the estimate never collapses to a small fraction of the low cap (a
+/// floor master passes); everything else is reported.
+#[tokio::test(start_paused = true)]
+async fn s4_shallow_droptail_capacity_step_15_to_5() {
+    const LOW: u64 = 5;
+    const HIGH: u64 = 15;
+    const STEP_AT: u64 = 10 * S;
+    const END: u64 = 30 * S;
+    let low = (LOW * 1_000_000) as f64;
+    for (i, seed) in [0xCC04_0001u64, 0xCC04_0002, 0xCC04_0003]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("s4a_shallow_step_15_5_seed{}", i + 1);
+        let cap = CapTimeline {
+            points: vec![(0, HIGH * MBIT), (STEP_AT, LOW * MBIT)],
+        };
+        let r = run(
+            seed,
+            cap,
+            Queue::DropTail25,
+            END / S,
+            &[],
+            OVERDRIVE * HIGH as f64,
+        )
+        .await;
+        assert_premises(&r, &name, 200);
+        let end = r.bwe_estimate_samples.last().unwrap().0 + 1;
+        shallow_report(&name, &r, low, STEP_AT, end);
+        let settled =
+            cc::median_bps(&r.bwe_estimate_samples, end.saturating_sub(8 * S), end).unwrap();
+        assert!(
+            settled as f64 >= 0.25 * low,
+            "{name}: the estimate settled at {settled} bit/s, under a quarter of the {low} cap"
+        );
+    }
+}
+
+/// S4b: the steady overload case: a constant 8 Mbit/s behind the same 25 ms
+/// buffer, 1.3 x offered, 30 s. Three seeds, same gate.
+#[tokio::test(start_paused = true)]
+async fn s4_shallow_droptail_steady_overload_c8() {
+    const CAP: u64 = 8;
+    const END: u64 = 30 * S;
+    let cap_bps = (CAP * 1_000_000) as f64;
+    for (i, seed) in [0xCC04_0011u64, 0xCC04_0012, 0xCC04_0013]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("s4b_shallow_overload_c8_seed{}", i + 1);
+        let r = run(
+            seed,
+            CapTimeline::constant(CAP * MBIT),
+            Queue::DropTail25,
+            END / S,
+            &[],
+            OVERDRIVE * CAP as f64,
+        )
+        .await;
+        assert_premises(&r, &name, 200);
+        let end = r.bwe_estimate_samples.last().unwrap().0 + 1;
+        shallow_report(&name, &r, cap_bps, 0, end);
+        let settled =
+            cc::median_bps(&r.bwe_estimate_samples, end.saturating_sub(8 * S), end).unwrap();
+        assert!(
+            settled as f64 >= 0.25 * cap_bps,
+            "{name}: the estimate settled at {settled} bit/s, under a quarter of the {cap_bps} cap"
+        );
+    }
 }
 
 /// Not a scene under test: prints the server->client rate each churn level
