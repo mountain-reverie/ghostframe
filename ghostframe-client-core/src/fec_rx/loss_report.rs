@@ -51,7 +51,22 @@ impl LossReporter {
         self.wire.on_received(bundle_seq);
         self.range = Some(match self.range {
             None => (bundle_seq, bundle_seq),
-            Some((lo, hi)) => (lo.min(bundle_seq), hi.max(bundle_seq)),
+            // Wrap-aware: `bundle_seq` is a u32 counter, and across its wrap a
+            // plain min/max would report `last_bundle_seq` as the pre-wrap
+            // value for ever after, so the server would never confirm a loss
+            // past it.
+            Some((lo, hi)) => (
+                if (bundle_seq.wrapping_sub(lo) as i32) < 0 {
+                    bundle_seq
+                } else {
+                    lo
+                },
+                if (bundle_seq.wrapping_sub(hi) as i32) > 0 {
+                    bundle_seq
+                } else {
+                    hi
+                },
+            ),
         });
         match self.newest {
             Some(n) if (bundle_seq.wrapping_sub(n) as i32) < 0 => {
@@ -164,5 +179,24 @@ mod tests {
         assert_eq!(rep.interval_ms, 250);
         // Deltas: an immediate second call reports nothing.
         assert!(r.maybe_report(250_001, &blocks).is_none());
+    }
+
+    #[test]
+    fn the_reported_range_survives_the_u32_wrap() {
+        let mut r = LossReporter::new();
+        let blocks = BlockStats::default();
+        assert!(r.maybe_report(0, &blocks).is_none());
+        // u32::MAX is never a bundle_seq (NO_ACK); the counter goes 0xFFFF_FFFE -> 0.
+        // 0xFFFF_FFFD arrives late, after 1, so the low end moves backwards.
+        for s in [u32::MAX - 3, u32::MAX - 1, 0, 1, u32::MAX - 2, 2] {
+            r.on_arrival(s);
+        }
+        let dg = r.maybe_report(250_000, &blocks).expect("report due");
+        let rep = LossReport::decode(&dg).unwrap();
+        assert_eq!(
+            (rep.first_bundle_seq, rep.last_bundle_seq),
+            (u32::MAX - 3, 2),
+            "first is the oldest and last the newest in wrapped order"
+        );
     }
 }
