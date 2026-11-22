@@ -16,9 +16,16 @@
 pub const REORDER_WINDOW: u32 = 64;
 /// Ring size; must exceed [`REORDER_WINDOW`] plus the largest gap handled in place.
 const RING: usize = 512;
-/// A forward jump larger than this is a new sequence space (session change),
-/// not a loss burst: resynchronise without counting it.
-const RESYNC_JUMP: u32 = 4096;
+/// A forward jump larger than this is a new sequence space, not a loss burst:
+/// resynchronise without counting it.
+///
+/// Within one `ClientCore` that does not happen: the server restarts its
+/// counters only for a new connection, which is a new core. So a large jump is
+/// a blackout, and it must be counted (a 0.4 s outage at 100 Mbit/s is about
+/// 4000 datagrams). The bound only stops an implausible value, a corrupt or
+/// hostile one, from being read as a loss of billions; 2^20 is about 100 s at
+/// 10 000 datagrams/s.
+const RESYNC_JUMP: u32 = 1 << 20;
 
 /// Cumulative counters. `run_hist[i]` counts settled loss runs of length
 /// 1, 2, 3, 4, 5-8, 9-16, 17-32, >32.
@@ -88,19 +95,46 @@ impl WireLossTracker {
         }
     }
 
+    /// Settle the slot at `settled_next`: lost if it never arrived.
+    fn settle_one(&mut self) {
+        let s = self.settled_next;
+        if *self.slot(s) {
+            self.close_run();
+        } else {
+            self.stats.lost_pre_fec += 1;
+            self.cur_run += 1;
+        }
+        *self.slot(s) = false;
+        self.settled_next = s.wrapping_add(1);
+    }
+
     /// Settle every slot older than the reorder window behind `newest`.
     fn settle(&mut self, newest: u32) {
         while (newest.wrapping_sub(self.settled_next) as i32) > REORDER_WINDOW as i32 {
-            let s = self.settled_next;
-            if *self.slot(s) {
-                self.close_run();
-            } else {
-                self.stats.lost_pre_fec += 1;
-                self.cur_run += 1;
-            }
-            *self.slot(s) = false;
-            self.settled_next = s.wrapping_add(1);
+            self.settle_one();
         }
+    }
+
+    /// A forward jump of `d` too large to clear slot by slot: the ring would
+    /// wrap over the slots still inside the reorder window (and over the
+    /// jump's own slot), so datagrams that did arrive would be counted lost.
+    /// Settle what is pending behind `newest` as it stands, count the gap
+    /// older than the new window by arithmetic, and restart the ring.
+    fn jump(&mut self, newest: u32, seq: u32, d: u32) {
+        while (newest.wrapping_sub(self.settled_next) as i32) >= 0 {
+            self.settle_one();
+        }
+        // Slots newest+1 .. seq-REORDER_WINDOW-1 never arrived.
+        let lost = (d - 1 - REORDER_WINDOW) as u64;
+        self.stats.lost_pre_fec += lost;
+        self.cur_run = self
+            .cur_run
+            .saturating_add(lost.min(u32::MAX as u64) as u32);
+        self.ring.iter_mut().for_each(|b| *b = false);
+        self.settled_next = seq.wrapping_sub(REORDER_WINDOW);
+        *self.slot(seq) = true;
+        self.newest = Some(seq);
+        self.stats.received += 1;
     }
 
     /// A datagram with this `wire_seq` arrived off the wire.
@@ -121,6 +155,10 @@ impl WireLossTracker {
                 self.settled_next = seq;
                 *self.slot(seq) = true;
                 self.stats.received += 1;
+                return;
+            }
+            if d as usize + REORDER_WINDOW as usize + 1 >= RING {
+                self.jump(newest, seq, d as u32);
                 return;
             }
             // Slots between are gaps until they fill in. Clear them before the
@@ -197,6 +235,59 @@ mod tests {
         assert!(s.received > 0);
     }
 
+    /// Every datagram up to `last` arrives, then the stream jumps `d` ahead
+    /// and continues in order: exactly `d - 1` were lost, whatever `d` is.
+    fn jumped(last: u32, d: u32) -> WireLossStats {
+        let mut t = WireLossTracker::new();
+        for s in 0..=last {
+            t.on_received(s);
+        }
+        let to = last + d;
+        for s in to..to + 300 {
+            t.on_received(s);
+        }
+        t.stats()
+    }
+
+    #[test]
+    fn a_jump_counts_exactly_the_skipped_datagrams_at_any_size() {
+        for d in [
+            2, 65, 100, 440, 446, 447, 448, 449, 511, 512, 513, 1000, 4096, 4097, 60_000,
+        ] {
+            let s = jumped(99, d);
+            assert_eq!(s.lost_pre_fec, (d - 1) as u64, "jump of {d}");
+            assert_eq!(s.max_run, d - 1, "run for a jump of {d}");
+            assert_eq!(s.received, 100 + 300, "received across a jump of {d}");
+        }
+    }
+
+    #[test]
+    fn a_jump_does_not_lose_the_datagrams_still_in_the_reorder_window() {
+        // 0..=99 arrived; 100 was skipped, 101 arrived (pending in window),
+        // then a 600-datagram blackout.
+        let mut t = WireLossTracker::new();
+        for s in (0..=99).chain([101]) {
+            t.on_received(s);
+        }
+        let to = 101 + 600;
+        for s in to..to + 300 {
+            t.on_received(s);
+        }
+        // 100 plus the 599 between 102 and 700.
+        assert_eq!(t.stats().lost_pre_fec, 1 + 599);
+    }
+
+    #[test]
+    fn a_blackout_is_loss_not_a_resync() {
+        // The old tracker read a 5000 jump as a new stream and counted none.
+        assert_eq!(jumped(99, 5000).lost_pre_fec, 4999);
+    }
+
+    #[test]
+    fn an_implausible_jump_is_a_resync() {
+        assert_eq!(jumped(99, RESYNC_JUMP + 1).lost_pre_fec, 0);
+    }
+
     #[test]
     fn reordering_inside_the_window_is_not_loss() {
         let mut t = WireLossTracker::new();
@@ -244,8 +335,8 @@ mod tests {
     #[test]
     fn a_huge_forward_jump_resynchronises_instead_of_counting_a_burst() {
         let mut t = run(200, &[]);
-        t.on_received(1_000_000);
-        for s in 1_000_001..1_000_300 {
+        t.on_received(5_000_000);
+        for s in 5_000_001..5_000_300 {
             t.on_received(s);
         }
         assert_eq!(t.stats().lost_pre_fec, 0);
