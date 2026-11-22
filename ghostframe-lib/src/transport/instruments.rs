@@ -674,6 +674,11 @@ pub struct InstrumentSummary {
     pub ledger_losses_declared: u64,
     /// Of those, handed to goog_cc.
     pub ledger_losses_flushed: u64,
+    /// Declared losses by class `[queue, local, path]`: those the client's
+    /// LOSS_REPORT confirmed (goog_cc is told of them, probe bursts aside) and
+    /// those it never did (phantoms, dropped unreported).
+    pub ledger_loss_class_confirmed: [u64; 3],
+    pub ledger_loss_class_unconfirmed: [u64; 3],
     /// Declared lost, then dropped unreported because the pending list hit
     /// its cap (oldest first).
     pub ledger_losses_overflowed: u64,

@@ -38,6 +38,7 @@
 //! quinn send buffers.
 
 use super::*;
+use crate::transport::fec_tx::queue_loss::LossClass;
 
 /// Path RTT of the live (HELLO'd) session only. An unauthenticated or
 /// evicted connection must not steer the BWE reference.
@@ -67,6 +68,22 @@ pub(super) struct PendingLoss {
     /// burst overshoots the link by design and what it drops says nothing about
     /// the rate the link carries, so goog_cc is not told of it.
     pub(super) in_probe_burst: bool,
+    /// What the ledger loss gate makes of it: a loss the stream's own queue (or
+    /// quinn's own discard) explains, or one the path dropped. Reported, not
+    /// acted on.
+    pub(super) class: LossClass,
+}
+
+impl LossClass {
+    /// Index into the per-class counters (`Ignored` never reaches them: the
+    /// peek classes every datagram as queue, local or path).
+    pub(super) fn counter_index(self) -> usize {
+        match self {
+            LossClass::Queue => 0,
+            LossClass::Local => 1,
+            LossClass::Path | LossClass::Ignored => 2,
+        }
+    }
 }
 
 /// Outstanding transmissions the ledger will hold. Sized by send rate x round
@@ -535,6 +552,11 @@ impl IoBridge {
         wire_seq: u32,
         tx: crate::transport::transmission_ledger::Transmission,
     ) {
+        // Read before the verdict, which consumes a local mark. Needs the
+        // acknowledgement tracking, which runs whatever the FEC mode.
+        let class = self
+            .queue_loss
+            .peek_class(wire_seq, self.bwe_ms(super::now_std()));
         if self.fec_adapt.is_some() {
             let now_ms = self.bwe_ms(super::now_std());
             self.queue_loss
@@ -544,16 +566,49 @@ impl IoBridge {
         // same clock the acknowledgements' send times are on, not the moment
         // it was built.
         let in_probe_burst = self.transmission_ledger.lost_in_probe_burst(wire_seq);
-        self.pending_losses.push(PendingLoss {
+        let loss = PendingLoss {
             wire_seq,
             emit_us: tx.depart_us.unwrap_or(tx.emit_us),
             wire_bytes: tx.wire_bytes,
             in_probe_burst,
-        });
+            class,
+        };
+        // Held until the client's report counts a gap for it.
+        let now_ms = self.bwe_ms(super::now_std());
+        if let Some(l) = self.loss_confirm.on_verdict(wire_seq, loss, now_ms) {
+            self.confirm_loss(l);
+        }
         self.loss_window
             .record(tx.emit_us as u32, true, tx.records.len() as u32);
         // CONTENT_REJECTED may still name it once its tombstone is gone.
         self.recent_bundles.remember(wire_seq, &tx);
+    }
+
+    /// The client counted a gap for this loss: it goes to goog_cc.
+    pub(super) fn confirm_loss(&mut self, l: PendingLoss) {
+        self.instr.loss_class_confirmed[l.class.counter_index()] += 1;
+        self.pending_losses.push(l);
+    }
+
+    /// A LOSS_REPORT reached `last_bundle_seq` and counted `gaps` gaps: the
+    /// held losses it confirms go to goog_cc.
+    pub(super) fn confirm_losses_from_report(&mut self, last_bundle_seq: u32, gaps: u16) {
+        let now_ms = self.bwe_ms(super::now_std());
+        for l in self.loss_confirm.on_report(last_bundle_seq, gaps, now_ms) {
+            self.confirm_loss(l);
+        }
+    }
+
+    /// Drop the losses no report confirmed in time: phantoms, which goog_cc
+    /// is never told of.
+    pub(super) fn expire_unconfirmed_losses(&mut self) {
+        if self.loss_confirm.held_len() == 0 && self.loss_confirm.is_idle() {
+            return;
+        }
+        let now_ms = self.bwe_ms(super::now_std());
+        for l in self.loss_confirm.expire(now_ms) {
+            self.instr.loss_class_unconfirmed[l.class.counter_index()] += 1;
+        }
     }
 
     /// Declare `wire_seqs` lost as a verdict would, for a test that is about

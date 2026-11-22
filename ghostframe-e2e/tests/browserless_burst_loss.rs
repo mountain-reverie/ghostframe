@@ -465,7 +465,16 @@ fn assert_instruments(n: &str, r: &BrowserlessResult, lossy: bool) {
             i.budget.gate_depth > 0 || i.budget.gate_tokens > 0,
             "{n}: admission never held work back under loss"
         );
+        // What the client's LOSS_REPORT counted reaches goog_cc, and what it
+        // did not (a phantom) does not: every declared loss is either
+        // confirmed, or still held, or was dropped unconfirmed; the flush is
+        // the confirmed ones less the probe-burst ones.
+        let confirmed: u64 = i.ledger_loss_class_confirmed.iter().sum();
         assert!(i.ledger_losses_flushed > 0, "{n}: no loss reached goog_cc");
+        assert!(
+            confirmed >= i.ledger_losses_flushed,
+            "{n}: flushed more than the client confirmed"
+        );
         assert!(
             i.ledger_losses_flushed + i.ledger_losses_overflowed <= i.ledger_losses_declared,
             "{n}: more losses accounted for than declared"
