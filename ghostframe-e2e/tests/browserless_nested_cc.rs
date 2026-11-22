@@ -699,8 +699,11 @@ fn shallow_report(name: &str, r: &BrowserlessResult, cap_bps: f64, step_us: u64,
 
 /// S4a: a 25 ms tail-drop buffer and a capacity step from 15 down to 5 Mbit/s
 /// held for 20 s, offered load above the high rate throughout. Three seeds.
-/// Gate: the estimate never collapses to a small fraction of the low cap (a
-/// floor master passes); everything else is reported.
+/// Gates, on every seed: the estimate does not collapse (at least a quarter of
+/// the low cap); the drop rate over the run stays under 8 % and the settled
+/// estimate is at most the cap. Measured: this branch drops 1.7 to 2.1 % and
+/// settles at 0.81 to 0.92 x the cap; a loss-blind master drops 16 to 18 % and
+/// settles at 1.12 to 1.13 x, over both bounds. Everything else is reported.
 #[tokio::test(start_paused = true)]
 async fn s4_shallow_droptail_capacity_step_15_to_5() {
     const LOW: u64 = 5;
@@ -734,11 +737,24 @@ async fn s4_shallow_droptail_capacity_step_15_to_5() {
             settled as f64 >= 0.25 * low,
             "{name}: the estimate settled at {settled} bit/s, under a quarter of the {low} cap"
         );
+        let loss_pct =
+            100.0 * r.s2c_datagrams_dropped as f64 / r.s2c_datagrams_offered.max(1) as f64;
+        assert!(
+            loss_pct < 8.0,
+            "{name}: {loss_pct:.2} % of the datagrams were dropped (measured 1.7 to 2.1 %, a loss-blind master 16 to 18 %)"
+        );
+        assert!(
+            settled as f64 <= low,
+            "{name}: the estimate settled at {settled} bit/s, above the {low} cap ({:.3} x; measured 0.81 to 0.92, a loss-blind master 1.12)",
+            settled as f64 / low
+        );
     }
 }
 
 /// S4b: the steady overload case: a constant 8 Mbit/s behind the same 25 ms
-/// buffer, 1.3 x offered, 30 s. Three seeds, same gate.
+/// buffer, 1.3 x offered, 30 s. Three seeds. Report-only apart from the
+/// no-collapse floor: it does not discriminate (a loss-blind master passes any
+/// bound this branch does), so no tighter gate is placed on it.
 #[tokio::test(start_paused = true)]
 async fn s4_shallow_droptail_steady_overload_c8() {
     const CAP: u64 = 8;
