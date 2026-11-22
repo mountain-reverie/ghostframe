@@ -168,6 +168,38 @@ const LIFT_SURVIVAL: f64 = 0.98;
 /// `AIMD_BACKOFF` as a float for the delivery test.
 const AIMD_BACKOFF_F: f64 = super::ceiling::AIMD_BACKOFF;
 
+/// goog_cc's loss-based estimator (v2), with one change to its defaults.
+///
+/// `not_increase_if_inherent_loss_less_than_average_loss` refuses every
+/// increase of the loss-limited estimate while the average reported loss is
+/// above the estimator's own *inherent loss* (the loss it believes the channel
+/// has whatever the rate). That estimate is a one-step Newton update that
+/// lags the average and is capped at `inherent_loss_upper_bound_offset`
+/// (0.05) plus `75 kbit/s / bandwidth`, so on a path with steady random loss
+/// the average can sit above it for long stretches and the estimate, once
+/// down, climbs back only on the observations where it does not. Measured:
+/// H.264 over 1 % i.i.d. loss at 100 Mbit/s averaged 57 Mbit/s with the guard
+/// on, against 95 without it, and at 5 % 39 against 94. Off,
+/// steady loss is what the model explains as inherent, and loss that rises
+/// with the sending rate is still caught where the model looks for it: the
+/// likelihood adds `(rate - bandwidth) / rate` to the loss probability of an
+/// observation sent above the candidate bandwidth, the preference for a higher
+/// bandwidth turns into one for a lower at 15 % loss
+/// (`loss_threshold_of_high_bandwidth_preference`), and the instant upper
+/// bound `75 kbit/s / (loss - 0.05)` caps the estimate outright. A 25 ms
+/// tail-drop buffer behind a 15 to 5 Mbit/s step lost 17 % of the stream with
+/// goog_cc loss-blind and about 2 % with this (see
+/// `browserless_nested_cc::s4_*`). Raising the two 0.05 offsets to 0.10 on top
+/// bought nothing at 1 % and little at 5 % and made the tail-drop scene lose
+/// 3 % and settle later; `use_byte_loss_rate` made 5 % worse. Both were left
+/// at the defaults.
+fn loss_based_bwe_v2() -> goog_cc::LossBasedBweV2Config {
+    goog_cc::LossBasedBweV2Config {
+        not_increase_if_inherent_loss_less_than_average_loss: false,
+        ..Default::default()
+    }
+}
+
 /// goog_cc's `pacing_factor`: the pacer rate is this times the loss-based
 /// target. 1.0: the pacer rate is the estimate.
 ///
@@ -379,6 +411,7 @@ impl GoogCcDriver {
             },
             field_trials: FieldTrials {
                 robust_throughput_estimator_settings: acked_rate_window(),
+                loss_based_bwe_v2: loss_based_bwe_v2(),
                 ..FieldTrials::default()
             },
         };
@@ -1229,6 +1262,16 @@ mod tests {
             );
         }
         (d.snapshot().stats, d.snapshot().bitrate_bps)
+    }
+
+    /// Steady random loss must not freeze the loss-limited estimate: with the
+    /// guard on, H.264 over 1 % i.i.d. loss at 100 Mbit/s stayed at 57 Mbit/s
+    /// (browserless_fec_adapt control_law_sweep, cell H264/iid1/100M).
+    #[test]
+    fn the_inherent_loss_guard_that_froze_the_estimate_on_steady_loss_is_off() {
+        let c = super::loss_based_bwe_v2();
+        assert!(c.enabled, "the loss-based half is on");
+        assert!(!c.not_increase_if_inherent_loss_less_than_average_loss);
     }
 
     #[test]
