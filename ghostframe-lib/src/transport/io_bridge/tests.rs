@@ -6077,6 +6077,68 @@ async fn only_a_loss_the_client_confirmed_reaches_goog_cc() {
     assert_eq!(bridge.instr.losses_flushed, 2);
 }
 
+/// A confirmed loss is withheld from goog_cc when it is probe padding or left
+/// inside the probe window itself, and reported when it left only in the
+/// drain after the window (or outside any burst): that queue is no longer the
+/// burst's overshoot.
+#[tokio::test]
+async fn a_probe_burst_withholds_padding_and_the_window_but_not_the_drain() {
+    use crate::transport::io_bridge::test_ack::{AckBatch, AckEntry};
+    use crate::transport::reliable_emitter::Content;
+    use crate::transport::transmission_ledger::Transmission;
+    let mut bridge = make_bridge_for_test().await;
+    let ms = std::time::Duration::from_millis;
+    let t0 = super::now_std()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("monotonic clock has 60 s of history");
+    // A window of 50 ms from t0 and 300 ms of drain after it.
+    bridge
+        .transmission_ledger
+        .mark_probe_window(t0, t0 + ms(50), t0 + ms(350));
+    let pad = |ws: u32| Transmission::single(1_000, 1_200, ws, Content::Pad(ws), None, None);
+    // 50: tile in the window. 51: tile in the drain. 52: pad in the drain.
+    // 53: tile long after. 54: pad in the window.
+    bridge
+        .transmission_ledger
+        .record_departed(50, t0 + ms(10), ledger_tx(1_000, 1_200, 50));
+    bridge
+        .transmission_ledger
+        .record_departed(51, t0 + ms(200), ledger_tx(1_000, 1_200, 51));
+    bridge
+        .transmission_ledger
+        .record_departed(52, t0 + ms(200), pad(52));
+    bridge
+        .transmission_ledger
+        .record_departed(53, t0 + ms(900), ledger_tx(1_000, 1_200, 53));
+    bridge
+        .transmission_ledger
+        .record_departed(54, t0 + ms(20), pad(54));
+    bridge.declare_lost_for_test(&[50, 51, 52, 53, 54]);
+    bridge.dispatch_loss_report_datagram(&loss_report(60, 5));
+    assert_eq!(bridge.pending_losses.len(), 5, "all five are confirmed");
+    bridge
+        .transmission_ledger
+        .record_departed(70, super::now_std(), ledger_tx(40_000, 1_200, 70));
+    let ack = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 70,
+            arrival_time_ms_lo16: 7,
+        }],
+    }
+    .encode();
+    bridge.dispatch_ack_v4_datagram(&ack);
+    bridge.post_turn().await.expect("post_turn");
+    assert_eq!(bridge.instr.losses_probe_burst, 3, "50, 52 and 54");
+    assert_eq!(bridge.instr.losses_flushed, 2, "51 and 53");
+    for (ws, withheld) in [(50, true), (51, false), (52, true), (53, false), (54, true)] {
+        assert_eq!(
+            bridge.instr.flushed.take(ws),
+            !withheld,
+            "wire_seq {ws}: withheld = {withheld}"
+        );
+    }
+}
+
 /// A sealed bundle that carries no record (a lone control frame) of `len` bytes.
 fn control_bundle(len: usize) -> crate::transport::fec_tx::packer::SealedBundle {
     crate::transport::fec_tx::packer::SealedBundle {

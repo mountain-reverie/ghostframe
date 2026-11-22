@@ -39,6 +39,7 @@
 
 use super::*;
 use crate::transport::fec_tx::queue_loss::LossClass;
+use crate::transport::transmission_ledger::BurstKind;
 
 /// Path RTT of the live (HELLO'd) session only. An unauthenticated or
 /// evicted connection must not steer the BWE reference.
@@ -64,9 +65,10 @@ pub(super) struct PendingLoss {
     pub(super) wire_seq: u32,
     pub(super) emit_us: u64,
     pub(super) wire_bytes: usize,
-    /// It departed inside a probe burst (a window and the queue it left). The
-    /// burst overshoots the link by design and what it drops says nothing about
-    /// the rate the link carries, so goog_cc is not told of it.
+    /// It is probe padding, or departed inside a probe window (not only the
+    /// drain after it). The window overshoots the link by design and what it
+    /// drops says nothing about the rate the link carries, so goog_cc is not
+    /// told of it. A datagram that left in the drain is judged as any other.
     pub(super) in_probe_burst: bool,
     /// Where in the burst, and what it carried (measurement).
     pub(super) burst: Option<crate::transport::transmission_ledger::BurstClass>,
@@ -570,13 +572,17 @@ impl IoBridge {
         // The loss is reported against the moment the datagram went out, the
         // same clock the acknowledgements' send times are on, not the moment
         // it was built.
-        let in_probe_burst = self.transmission_ledger.lost_in_probe_burst(wire_seq);
+        let burst = self.transmission_ledger.probe_burst_class(wire_seq);
+        // Withheld from goog_cc: probe padding, and whatever departed inside
+        // the window itself. A datagram that left only in the drain after it
+        // is judged as any other.
+        let in_probe_burst = burst.is_some_and(|b| b.in_window || b.kind == BurstKind::Pad);
         let loss = PendingLoss {
             wire_seq,
             emit_us: tx.depart_us.unwrap_or(tx.emit_us),
             wire_bytes: tx.wire_bytes,
             in_probe_burst,
-            burst: self.transmission_ledger.probe_burst_class(wire_seq),
+            burst,
             class,
         };
         // Held until the client's report counts a gap for it.
