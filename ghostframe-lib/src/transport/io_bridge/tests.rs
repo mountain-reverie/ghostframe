@@ -6064,9 +6064,15 @@ async fn only_a_loss_the_client_confirmed_reaches_goog_cc() {
     assert_eq!(bridge.instr.loss_class_confirmed.iter().sum::<u64>(), 2);
     assert_eq!(bridge.loss_confirm.held_len(), 8);
     // Nobody confirms the rest: they are counted as unconfirmed, not reported.
-    for l in bridge.loss_confirm.expire(u64::MAX / 2) {
-        bridge.instr.loss_class_unconfirmed[l.class.counter_index()] += 1;
-    }
+    // Through the loop's own expiry: not yet at the hard maximum age (the
+    // stream has sent nothing past them), then past it.
+    let now_ms = bridge.bwe_ms(super::now_std());
+    bridge.expire_unconfirmed_losses_at(now_ms);
+    assert_eq!(bridge.loss_confirm.held_len(), 8, "too young to drop");
+    bridge.expire_unconfirmed_losses_at(
+        now_ms + crate::transport::fec_tx::loss_confirm::MAX_AGE_MS + 1,
+    );
+    assert_eq!(bridge.loss_confirm.held_len(), 0);
     assert_eq!(bridge.instr.loss_class_unconfirmed.iter().sum::<u64>(), 8);
     assert_eq!(bridge.instr.losses_flushed, 2);
 }

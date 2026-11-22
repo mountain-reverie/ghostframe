@@ -370,6 +370,8 @@ pub struct TransmissionLedger {
     /// ledger (acknowledged, declared lost, evicted or replaced): the
     /// sampler's `bytes_in_flight`.
     departed_bytes: u64,
+    /// The newest `wire_seq` ever recorded (wrap-aware), resolved or not.
+    newest_recorded: Option<u32>,
 }
 
 impl TransmissionLedger {
@@ -402,7 +404,14 @@ impl TransmissionLedger {
             verdicts: 0,
             spurious_bits: 0,
             departed_bytes: 0,
+            newest_recorded: None,
         }
+    }
+
+    /// The newest `wire_seq` recorded so far: how far the stream has got, for
+    /// a rule that waits for newer sequences to be sent.
+    pub fn newest_recorded(&self) -> Option<u32> {
+        self.newest_recorded
     }
 
     /// Keep `K_PKT` at its initial value whatever the spurious rate says. The
@@ -512,6 +521,12 @@ impl TransmissionLedger {
     /// [`Self::mark_departed`]: a transmission still queued in the emitter or
     /// in quinn's FIFO has not been sent, so it cannot have been lost.
     pub fn record(&mut self, wire_seq: u32, at: Instant, tx: Transmission) {
+        if self
+            .newest_recorded
+            .is_none_or(|n| (wire_seq.wrapping_sub(n) as i32) > 0)
+        {
+            self.newest_recorded = Some(wire_seq);
+        }
         let rec = Record {
             recorded_at: at,
             departed: None,
@@ -769,6 +784,7 @@ impl TransmissionLedger {
         self.last_reo_raise = None;
         self.last_spurious_ack = None;
         self.departed_bytes = 0;
+        self.newest_recorded = None;
         self.k_pkt = K_PKT_INITIAL;
         self.verdicts = 0;
         self.spurious_bits = 0;

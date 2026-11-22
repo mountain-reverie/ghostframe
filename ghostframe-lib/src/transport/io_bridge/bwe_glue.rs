@@ -602,11 +602,17 @@ impl IoBridge {
     /// Drop the losses no report confirmed in time: phantoms, which goog_cc
     /// is never told of.
     pub(super) fn expire_unconfirmed_losses(&mut self) {
-        if self.loss_confirm.held_len() == 0 && self.loss_confirm.is_idle() {
+        let now_ms = self.bwe_ms(super::now_std());
+        self.expire_unconfirmed_losses_at(now_ms);
+    }
+
+    /// [`Self::expire_unconfirmed_losses`] at `now_ms` on the BWE clock.
+    pub(super) fn expire_unconfirmed_losses_at(&mut self, now_ms: u64) {
+        if self.loss_confirm.is_idle() {
             return;
         }
-        let now_ms = self.bwe_ms(super::now_std());
-        for l in self.loss_confirm.expire(now_ms) {
+        let newest = self.transmission_ledger.newest_recorded();
+        for l in self.loss_confirm.expire(now_ms, newest) {
             self.instr.loss_class_unconfirmed[l.class.counter_index()] += 1;
         }
     }

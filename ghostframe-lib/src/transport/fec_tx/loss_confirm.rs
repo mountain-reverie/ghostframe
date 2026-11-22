@@ -25,8 +25,10 @@
 //! covers it: an earlier report's unspent gaps (`last >= seq`), or the next
 //! report's. Whichever of the two comes second finds the other waiting. Of the
 //! verdicts a report covers the oldest go first. A held verdict nobody
-//! confirms within [`TTL_MS`] is dropped, as is a budget nobody spends. A
-//! verdict a late acknowledgement contradicts is withdrawn.
+//! confirms is dropped once it is [`TTL_MS`] old *and* [`MIN_NEWER_SENT`]
+//! newer sequences have been sent since it (or at [`MAX_AGE_MS`] whatever was
+//! sent); a budget nobody spends is dropped after [`TTL_MS`]. A verdict a late
+//! acknowledgement contradicts is withdrawn.
 //!
 //! The property that matters: the losses released never exceed the gaps the
 //! client reported. A stall, which makes verdicts for datagrams the client
@@ -39,11 +41,36 @@
 use super::queue_loss::SeqUnwrap;
 use std::collections::{BTreeMap, VecDeque};
 
-/// How long a verdict waits for a report, and a report's gaps for a verdict, ms.
-/// The loss path's horizon is about 600 ms and the client reports every
-/// 250 ms, so a real loss is confirmed well inside this; a longer wait lets a
-/// stale phantom take a later loss's gap.
+/// The shortest time a verdict waits for a report, and how long a report's
+/// gaps wait for a verdict, ms. The loss path's horizon is about 600 ms and
+/// the client reports every 250 ms, so at a normal rate a real loss is
+/// confirmed well inside this; a longer wait lets a stale phantom take a
+/// later loss's gap.
+///
+/// That holds only while the stream is fast. The client counts a gap after
+/// [`CLIENT_REORDER_WINDOW`] newer sequences have arrived, so at a low rate
+/// (the 300 kbit/s floor is about 30 datagrams/s) the confirmation comes
+/// seconds after the loss. A held verdict is therefore also kept until
+/// [`MIN_NEWER_SENT`] sequences have been sent past it.
+///
+/// A budget keeps the plain time rule: it is spent by the ledger's verdicts,
+/// which come from acknowledgements and the loss path's own timers, not from
+/// the client's reorder window, and a budget that waits for long is how a
+/// stale phantom takes a later loss's gap.
 pub(crate) const TTL_MS: u64 = 2_000;
+/// The client's reorder window: the number of newer `wire_seq`s it must have
+/// received before it counts a gap
+/// (`ghostframe-client-core/src/wire_loss.rs`, `REORDER_WINDOW`). This is a
+/// copy; the two must agree.
+const CLIENT_REORDER_WINDOW: i64 = 64;
+/// Sequences that must have been sent past a held verdict before it may
+/// expire: twice the client's window, so a report that needs the window to
+/// fill has had it fill, and a further window of margin for the datagrams the
+/// network drops on the way.
+pub(crate) const MIN_NEWER_SENT: i64 = 2 * CLIENT_REORDER_WINDOW;
+/// The most a verdict waits whatever was sent (an idle stream sends nothing,
+/// so the sequence rule alone would hold it for ever), ms.
+pub(crate) const MAX_AGE_MS: u64 = 10_000;
 /// Verdicts held.
 const HELD_CAP: usize = 4_096;
 /// Reports whose gaps are unspent.
@@ -74,6 +101,10 @@ struct Budget {
 pub(crate) struct LossConfirmer<T> {
     seq: SeqUnwrap,
     held: BTreeMap<i64, (u64, T)>,
+    /// `(held at, key)` in the order they were held, for `expire` to stop at
+    /// the first verdict that may not expire yet. An entry whose verdict was
+    /// confirmed, withdrawn or pushed out is skipped when it reaches the front.
+    by_time: VecDeque<(u64, i64)>,
     budgets: VecDeque<Budget>,
     /// Verdicts pushed out by the cap, handed back by the next `expire`.
     pushed_out: Vec<T>,
@@ -85,6 +116,7 @@ impl<T> Default for LossConfirmer<T> {
         Self {
             seq: SeqUnwrap::default(),
             held: BTreeMap::new(),
+            by_time: VecDeque::new(),
             budgets: VecDeque::new(),
             pushed_out: Vec::new(),
             stats: LossConfirmStats::default(),
@@ -103,7 +135,10 @@ impl<T> LossConfirmer<T> {
 
     /// Nothing held, no budget, nothing pushed out: `expire` has no work.
     pub(crate) fn is_idle(&self) -> bool {
-        self.held.is_empty() && self.budgets.is_empty() && self.pushed_out.is_empty()
+        self.held.is_empty()
+            && self.by_time.is_empty()
+            && self.budgets.is_empty()
+            && self.pushed_out.is_empty()
     }
 
     /// A different connection is live: its sequence numbers are not these.
@@ -129,6 +164,7 @@ impl<T> LossConfirmer<T> {
             return Some(item);
         }
         self.held.insert(u, (now_ms, item));
+        self.by_time.push_back((now_ms, u));
         while self.held.len() > HELD_CAP {
             if let Some((_, (_, old))) = self.held.pop_first() {
                 self.stats.unconfirmed += 1;
@@ -179,21 +215,38 @@ impl<T> LossConfirmer<T> {
         gone
     }
 
-    /// Drop what has waited [`TTL_MS`]; returns the verdicts no report
-    /// confirmed (the pushed-out ones too), for the caller to count.
-    pub(crate) fn expire(&mut self, now_ms: u64) -> Vec<T> {
+    /// Drop the verdicts that have waited long enough (see the module
+    /// comment); `newest_sent` is the newest `wire_seq` sent so far. Returns the
+    /// verdicts no report confirmed (the pushed-out ones too), for the caller to
+    /// count.
+    ///
+    /// Only the front of the time queue is looked at, so a turn with nothing to
+    /// drop costs O(1). A verdict held behind one that may not expire yet waits
+    /// for it, at most until [`MAX_AGE_MS`].
+    pub(crate) fn expire(&mut self, now_ms: u64, newest_sent: Option<u32>) -> Vec<T> {
         let mut out = std::mem::take(&mut self.pushed_out);
-        let stale: Vec<i64> = self
-            .held
-            .iter()
-            .filter(|(_, (at, _))| at + TTL_MS <= now_ms)
-            .map(|(&k, _)| k)
-            .collect();
-        for k in stale {
-            if let Some((_, item)) = self.held.remove(&k) {
+        let newest = newest_sent.map(|n| self.seq.at(n));
+        while let Some(&(at, key)) = self.by_time.front() {
+            if !self.held.get(&key).is_some_and(|(a, _)| *a == at) {
+                self.by_time.pop_front();
+                continue;
+            }
+            let age = now_ms.saturating_sub(at);
+            let passed = newest.is_some_and(|n| n - key >= MIN_NEWER_SENT);
+            if !(age >= MAX_AGE_MS || (age >= TTL_MS && passed)) {
+                break;
+            }
+            self.by_time.pop_front();
+            if let Some((_, item)) = self.held.remove(&key) {
                 self.stats.unconfirmed += 1;
                 out.push(item);
             }
+        }
+        // Confirmations and withdrawals leave their entries behind.
+        if self.by_time.len() > 2 * self.held.len() + 64 {
+            let held = &self.held;
+            self.by_time
+                .retain(|(at, k)| held.get(k).is_some_and(|(a, _)| a == at));
         }
         while self
             .budgets
@@ -229,7 +282,7 @@ mod tests {
         assert!(verdicts(&mut c, 100..600, 1_000).is_empty());
         assert!(c.on_report(700, 0, 1_100).is_empty());
         assert_eq!(c.held_len(), 500);
-        let dropped = c.expire(1_000 + TTL_MS);
+        let dropped = c.expire(1_000 + TTL_MS, Some(800));
         assert_eq!(dropped.len(), 500, "unconfirmed, so dropped");
         let s = c.stats();
         assert_eq!((s.confirmed, s.unconfirmed), (0, 500));
@@ -264,7 +317,7 @@ mod tests {
         // A budget nobody spends expires, and is counted.
         let mut e: LossConfirmer<u32> = LossConfirmer::default();
         e.on_report(500, 4, 1_000);
-        e.expire(1_000 + TTL_MS);
+        e.expire(1_000 + TTL_MS, None);
         assert_eq!(e.stats().gaps_unspent, 4);
         assert_eq!(e.on_verdict(480, 480, 1_000 + TTL_MS), None);
     }
@@ -295,7 +348,64 @@ mod tests {
         let mut c = LossConfirmer::default();
         verdicts(&mut c, 0..(HELD_CAP as u32 + 5), 1_000);
         assert_eq!(c.held_len(), HELD_CAP);
-        let out = c.expire(1_001);
+        let out = c.expire(1_001, None);
         assert_eq!(out, vec![0, 1, 2, 3, 4]);
+    }
+
+    /// 30 datagrams/s: the client's window of 64 takes over two seconds to fill,
+    /// so its report for a loss comes 2.4 s after the verdict. The old rule (a
+    /// plain 2 s wait) had dropped the verdict by then.
+    #[test]
+    fn at_a_low_rate_a_loss_whose_report_is_late_is_still_confirmed() {
+        const RATE: u64 = 30;
+        let mut c = LossConfirmer::default();
+        assert!(c.on_verdict(100, 100u32, 1_000).is_none());
+        let mut dropped = Vec::new();
+        for t in (1_000..3_400).step_by(33) {
+            let sent = 100 + (RATE * (t - 1_000) / 1_000) as u32;
+            dropped.extend(c.expire(t, Some(sent)));
+        }
+        assert!(dropped.is_empty(), "dropped before its report: {dropped:?}");
+        assert_eq!(c.on_report(172, 1, 3_400), vec![100]);
+        assert_eq!(c.stats().confirmed, 1);
+        assert_eq!(c.stats().unconfirmed, 0);
+    }
+
+    #[test]
+    fn a_verdict_expires_only_when_old_enough_and_passed_by_enough_sequences() {
+        let mut c = LossConfirmer::default();
+        c.on_verdict(100, 100u32, 1_000);
+        // Old enough, not passed.
+        assert!(c.expire(1_000 + TTL_MS, Some(100 + 127)).is_empty());
+        // Passed, not old enough.
+        assert!(c.expire(1_000 + TTL_MS - 1, Some(100 + 128)).is_empty());
+        // Both.
+        assert_eq!(c.expire(1_000 + TTL_MS, Some(100 + 128)), vec![100]);
+        // Nothing sent since: goes at the hard maximum, not before.
+        c.on_verdict(300, 300, 5_000);
+        assert!(c.expire(5_000 + MAX_AGE_MS - 1, Some(300)).is_empty());
+        assert_eq!(c.expire(5_000 + MAX_AGE_MS, Some(300)), vec![300]);
+        assert_eq!(c.stats().unconfirmed, 2);
+        assert!(c.is_idle());
+    }
+
+    #[test]
+    fn expiry_survives_a_sequence_wrap() {
+        let mut c = LossConfirmer::default();
+        let near = u32::MAX - 10;
+        c.on_verdict(near, near, 1_000);
+        // 128 newer sent: the newest is across the wrap.
+        let newest = near.wrapping_add(128);
+        assert!(newest < 200);
+        assert_eq!(c.expire(1_000 + TTL_MS, Some(newest)), vec![near]);
+    }
+
+    #[test]
+    fn a_confirmed_verdict_does_not_hold_up_expiry_behind_it() {
+        let mut c = LossConfirmer::default();
+        c.on_verdict(10, 10u32, 1_000);
+        c.on_verdict(11, 11, 1_100);
+        assert_eq!(c.on_report(10, 1, 1_200), vec![10]);
+        assert_eq!(c.expire(1_100 + TTL_MS, Some(11 + 128)), vec![11]);
     }
 }
