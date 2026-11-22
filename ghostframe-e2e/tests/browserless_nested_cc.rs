@@ -786,6 +786,128 @@ async fn s4_shallow_droptail_steady_overload_c8() {
     }
 }
 
+/// Approximate loss over `[from_us, to_us)` of virtual time, in percent: the
+/// bytes the server offered the link in that span against the bytes that came
+/// out, counted as the delivered datagrams times the run's mean datagram size.
+/// Both are attributed to the time the datagram was offered. `None` when
+/// nothing was offered.
+fn window_loss_pct(r: &BrowserlessResult, from_us: u64, to_us: u64) -> Option<f64> {
+    use ghostframe_e2e::harness::browserless::OFFERED_BIN_US;
+    let lo = (from_us / OFFERED_BIN_US) as usize;
+    let hi = ((to_us / OFFERED_BIN_US) as usize).min(r.s2c_offered_bins.len());
+    let offered: u64 = r
+        .s2c_offered_bins
+        .get(lo..hi)?
+        .iter()
+        .map(|&b| b as u64)
+        .sum();
+    if offered == 0 {
+        return None;
+    }
+    let mean = r.bytes_delivered_s2c as f64 / r.datagrams_delivered_s2c.max(1) as f64;
+    let delivered = r
+        .s2c_transit_samples
+        .iter()
+        .filter(|(t, _)| *t >= from_us && *t < to_us)
+        .count() as f64
+        * mean;
+    Some((100.0 * (1.0 - delivered / offered as f64)).max(0.0))
+}
+
+/// Restores the production setting of the inherent-loss guard when the scene
+/// ends, panic or not.
+struct GuardReset;
+impl Drop for GuardReset {
+    fn drop(&mut self) {
+        ghostframe_lib::transport::bwe::set_inherent_loss_guard(false);
+    }
+}
+
+/// S4c: steady congestion loss of 2 to 5 % on a shallow tail-drop buffer,
+/// with goog_cc's inherent-loss guard off (production) against on. Report
+/// only; asserts premises (the estimator ran, the link dropped) and nothing
+/// about the numbers.
+///
+/// The concern: with `not_increase_if_inherent_loss_less_than_average_loss`
+/// off, loss under about 5 % may be fitted as inherent, so an estimate above
+/// the link could stay there while the loss passes 5.75 %; and the delay of the
+/// client's confirmation may pin a loss on the wrong sending rate.
+///
+/// The sender's rate is the estimator's, so the loss cannot be set directly.
+/// The scene starts it at a link of 10 Mbit/s with the estimate settled near
+/// it and steps the link down by 2, 3.5 and 5 %: a sender that stays where it
+/// was loses that share to the 25 ms buffer. What the estimate does next is
+/// the measurement: `loss_pct_first10s` says whether the sender was in the
+/// regime, `loss_pct_settled` and `settled_over_cap` whether it stayed.
+/// Three seeds per cell, and each arm runs all the cells before the other.
+///
+/// Run on demand (about 10 minutes):
+/// `cargo test --release --test browserless_nested_cc s4c -- --ignored --nocapture --test-threads=1`
+#[tokio::test(start_paused = true)]
+#[ignore = "report-only comparison, ~10 min; run on demand"]
+async fn s4c_shallow_droptail_steady_congestion_loss_guard_off_vs_on() {
+    const HIGH: u64 = 10;
+    const STEP_AT: u64 = 10 * S;
+    const END: u64 = 50 * S;
+    let _reset = GuardReset;
+    for guard_on in [false, true] {
+        ghostframe_lib::transport::bwe::set_inherent_loss_guard(guard_on);
+        let arm = if guard_on { "guard_on" } else { "guard_off" };
+        for step_pct in [2.0f64, 3.5, 5.0] {
+            let low_bps = HIGH as f64 * 1e6 * (1.0 - step_pct / 100.0);
+            for (i, seed) in [0xCC04_0021u64, 0xCC04_0022, 0xCC04_0023]
+                .into_iter()
+                .enumerate()
+            {
+                let name = format!("s4c_{arm}_step{step_pct}pct_seed{}", i + 1);
+                let cap = CapTimeline {
+                    points: vec![(0, HIGH * MBIT), (STEP_AT, (low_bps / 8.0) as u64)],
+                };
+                let r = run(
+                    seed,
+                    cap,
+                    Queue::DropTail25,
+                    END / S,
+                    &[],
+                    OVERDRIVE * HIGH as f64,
+                )
+                .await;
+                assert_premises(&r, &name, 200);
+                assert!(
+                    r.s2c_datagrams_dropped > 0,
+                    "{name}: the link never dropped"
+                );
+                let end = r.bwe_estimate_samples.last().unwrap().0 + 1;
+                let from = end.saturating_sub(20 * S);
+                let pct = |v: Option<f64>| v.map_or("none".to_string(), |x| format!("{x:.2}"));
+                metric(
+                    &name,
+                    "loss_pct_first10s",
+                    pct(window_loss_pct(&r, STEP_AT, STEP_AT + 10 * S)),
+                );
+                metric(
+                    &name,
+                    "loss_pct_settled",
+                    pct(window_loss_pct(&r, from, end)),
+                );
+                if let Some(m) = cc::median_bps(&r.bwe_estimate_samples, from, end) {
+                    metric(&name, "settled_median_bps", m);
+                    metric(
+                        &name,
+                        "settled_over_cap",
+                        format!("{:.3}", m as f64 / low_bps),
+                    );
+                }
+                metric(
+                    &name,
+                    "queue_delay_p95_ms_settled",
+                    fmt_opt(queue_delay_p95_ms(&r, from, end)),
+                );
+            }
+        }
+    }
+}
+
 /// Not a scene under test: prints the server->client rate each churn level
 /// achieves on an uncapped link, so "heavy" is a measured number rather than
 /// a guess. Needed because the pacer terms make the offered

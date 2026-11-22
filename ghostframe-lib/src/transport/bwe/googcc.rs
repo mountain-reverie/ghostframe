@@ -194,10 +194,27 @@ const AIMD_BACKOFF_F: f64 = super::ceiling::AIMD_BACKOFF;
 /// 3 % and settle later; `use_byte_loss_rate` made 5 % worse. Both were left
 /// at the defaults.
 fn loss_based_bwe_v2() -> goog_cc::LossBasedBweV2Config {
+    #[cfg(feature = "browserless-harness")]
+    let guard = INHERENT_LOSS_GUARD.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "browserless-harness"))]
+    let guard = false;
     goog_cc::LossBasedBweV2Config {
-        not_increase_if_inherent_loss_less_than_average_loss: false,
+        not_increase_if_inherent_loss_less_than_average_loss: guard,
         ..Default::default()
     }
+}
+
+/// The harness's switch for the guard above, to compare the two settings in
+/// one binary. Read when an estimator is built. Off (the production setting)
+/// unless a scene turns it on, and absent from a build without the harness.
+#[cfg(feature = "browserless-harness")]
+static INHERENT_LOSS_GUARD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the inherent-loss guard on or off for estimators built from now on.
+#[cfg(feature = "browserless-harness")]
+pub fn set_inherent_loss_guard(on: bool) {
+    INHERENT_LOSS_GUARD.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// goog_cc's `pacing_factor`: the pacer rate is this times the loss-based
