@@ -159,6 +159,11 @@ impl IoBridge {
         self.dirty_tracker.reset();
         self.metrics_tracker.reset();
         self.classifier.reset();
+        // The previous client's send rate and held run limit are not the new
+        // client's.
+        if let Some(a) = self.fec_adapt.as_mut() {
+            a.reset_session();
+        }
         self.bwe_samples_at_session_reset = self.bwe.snapshot().samples_seen;
         self.adaptation_context.estimate_known = false;
         self.scheduler.clear();

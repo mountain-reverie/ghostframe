@@ -41,7 +41,9 @@
 
 use ghostframe_protocol::fec::feedback::LossReport;
 
-use super::adapt_size::{DeclinedTrim, Ladder, Notch, RSizer};
+use super::adapt_size::{
+    r_cap, widest_block_sources, DeclinedTrim, Ladder, Notch, RSizer, SourceRate,
+};
 use super::block_table::CloseReason;
 use crate::config::FecBlockParams;
 use crate::transport::io_bridge::FecAdaptProbe;
@@ -92,6 +94,133 @@ const Z_RELEASE: f64 = 2.33;
 /// Run lengths the histogram buckets stand for: 1, 2, 3, 4, 5-8, 9-16,
 /// 17-32, >32.
 const RUN_REPRESENTATIVES: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 6.5, 12.5, 24.5, 40.0];
+/// Shortest and longest run each bucket can hold (the last has no bound).
+const RUN_LOWER: [u32; 8] = [1, 2, 3, 4, 5, 9, 17, 33];
+const RUN_UPPER: [Option<u32>; 8] = [
+    Some(1),
+    Some(2),
+    Some(3),
+    Some(4),
+    Some(8),
+    Some(16),
+    Some(32),
+    None,
+];
+/// Runs of at most this many datagrams are always left to FEC, however small
+/// the block: on a slow link a block has one or two repair symbols, and an
+/// ordinary short burst is the case FEC is for.
+pub(crate) const FEC_UNREPAIRABLE_FLOOR: u32 = 4;
+/// The longest loss run FEC could be asked to repair at a block of `k`
+/// sources: a run straddling two blocks, each of which rebuilds `r_cap(k)` at
+/// most, so `2 x r_cap(k)` (at most 64), and never under
+/// [`FEC_UNREPAIRABLE_FLOOR`]. A longer run destroys at least one block past
+/// anything its repair symbols could rebuild; it is for the resend path, and
+/// must neither engage FEC nor raise its estimates.
+///
+/// (`2 x k`, two blocks of sources, was tried first and is far too loose: it
+/// is 40 ms of datagrams, and an outage's gap is about `2 x R x (RTT + 5 ms)`
+/// whatever the rate `R`, so below an RTT of 15 to 28 ms the outage was under
+/// the limit and engaged FEC.)
+pub(crate) fn repairable_run_limit(k: u32) -> u32 {
+    (2 * r_cap(k)).max(FEC_UNREPAIRABLE_FLOOR)
+}
+
+/// How long the run limit stays at the highest value it reached, us. The
+/// limit follows the block width, which follows the rate, and it steps at the
+/// histogram's bucket edges (9 to 16 flips near 2.2 Mbit/s): a loss-driven
+/// cut of the estimate must not move a run from one side of it to the other.
+/// The rate it follows is already a 1 to 2 s mean, so the hold only has to
+/// cover what the cut takes to reach a report: the run's forced close (1 s),
+/// the report interval (0.25 s) and a round trip. 3 s does. It was 10 s, on a
+/// peak that already lasted 5 to 10 s, and one burst held the limit up for 20
+/// s; with a mean the longest a burst is felt is the 2 s of the mean and the
+/// 3 s of the hold.
+const RUN_LIMIT_HOLD_US: u64 = 3_000_000;
+
+/// The run limit held at its highest for [`RUN_LIMIT_HOLD_US`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HeldLimit {
+    held: u32,
+    at_us: u64,
+}
+
+impl HeldLimit {
+    /// Fold in the limit `raw` now implies and return the one to use: the
+    /// highest within the hold, `raw` once the hold has passed.
+    pub(crate) fn hold(&mut self, raw: u32, now_us: u64) -> u32 {
+        if raw >= self.held || now_us.saturating_sub(self.at_us) >= RUN_LIMIT_HOLD_US {
+            self.held = raw;
+            self.at_us = now_us;
+        }
+        self.held
+    }
+}
+
+/// What a report's histogram says about runs FEC could not repair.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RunSplit {
+    /// Upper bound of the losses that are in runs FEC could repair (or not
+    /// shown to be longer): never below the true count of those.
+    pub(crate) kept: f64,
+    /// The histogram of the runs that stay (a left-out bucket reads 0).
+    pub(crate) runs: [f64; 8],
+    /// Runs left out.
+    pub(crate) runs_unrepairable: u64,
+    /// `lost - kept`: losses left out, at least what the left-out runs hold.
+    pub(crate) losses_unrepairable: u64,
+}
+
+/// Split `lost` losses by the report's run histogram around `limit`.
+///
+/// A bucket is left out when its LOWER bound exceeds `limit`: every run in it
+/// is longer than FEC could repair. The `>32` bucket is always left out: the
+/// limit is at most 64 (`2 x r_cap`, `r_cap <= 32`), and a run of 33 to 64 is
+/// at the edge of what two full blocks could split between them, while a
+/// bucket with no upper bound cannot be told apart from an outage by its
+/// count. (Deciding it by the report's total instead keeps a run that a
+/// second long run in the same report hides: 70 + 70 at limit 42.)
+///
+/// The losses left out are not `count x representative` (the `>32`
+/// representative, 40, can be far under the real run: 870 in a measured
+/// outage); only `count x lower bound` is certain.
+///
+/// What is kept is bounded from above two ways, and the smaller is used:
+/// `lost - (the left-out minimum)`, and what the kept runs can hold at most
+/// (`count x upper`). So `kept = min(.., ..)`, clamped at 0: a report whose
+/// only run is an outage keeps nothing. An upper bound on `kept` errs toward
+/// protection. O(8).
+pub(crate) fn split_runs(lost: u32, hist: &[u16; 8], limit: u32) -> RunSplit {
+    let lost = u64::from(lost);
+    let mut runs = [0.0f64; 8];
+    let mut excl_min = 0u64;
+    let mut runs_excl = 0u64;
+    let mut kept_cap = 0u64;
+    for i in 0..8 {
+        let c = u64::from(hist[i]);
+        if i == 7 || RUN_LOWER[i] > limit {
+            runs_excl += c;
+            excl_min += c * u64::from(RUN_LOWER[i]);
+        } else {
+            runs[i] = f64::from(hist[i]);
+            kept_cap += c * u64::from(RUN_UPPER[i].unwrap_or(0));
+        }
+    }
+    if runs_excl == 0 {
+        return RunSplit {
+            kept: lost as f64,
+            runs,
+            runs_unrepairable: 0,
+            losses_unrepairable: 0,
+        };
+    }
+    let kept = lost.saturating_sub(excl_min).min(kept_cap);
+    RunSplit {
+        kept: kept as f64,
+        runs,
+        runs_unrepairable: runs_excl,
+        losses_unrepairable: lost - kept,
+    }
+}
 
 /// `P(X >= l)` for `X ~ Poisson(mu)`, `l` real (linear between the integers
 /// around it: the decayed count is fractional). At most `l + 1` terms.
@@ -142,6 +271,9 @@ pub(crate) struct LossEstimator {
     changes: u64,
     congestion_skips: u64,
     losses_excused: u64,
+    /// Runs and losses left out as unrepairable (cumulative).
+    runs_unrepairable: u64,
+    losses_unrepairable: u64,
 }
 
 impl LossEstimator {
@@ -160,6 +292,8 @@ impl LossEstimator {
             changes: 0,
             congestion_skips: 0,
             losses_excused: 0,
+            runs_unrepairable: 0,
+            losses_unrepairable: 0,
         }
     }
 
@@ -167,7 +301,7 @@ impl LossEstimator {
     /// `total` but its losses to nothing (plan decision 4).
     #[cfg(test)]
     pub(crate) fn on_report(&mut self, r: &LossReport, congested: bool, now_us: u64) {
-        self.on_report_excusing(r, congested, 0, now_us);
+        self.on_report_excusing(r, congested, 0, u32::MAX, now_us);
     }
 
     /// [`Self::on_report`] with `excused` of the report's losses charged to
@@ -176,11 +310,25 @@ impl LossEstimator {
     /// left out of `lost`; the run histogram is scaled by what is left, since
     /// which runs were the excused ones is not known. A report whose every
     /// loss is excused adds no runs at all.
+    ///
+    /// Runs longer than `limit` (see [`split_runs`]) are left out of `lost`,
+    /// `lost_e`, `runs` and `run_lost` as well: FEC cannot repair them, the
+    /// resend path or the acknowledged-reference recovery does, and they must
+    /// neither engage FEC nor raise its estimates. Their datagrams stay in
+    /// `total`. How the two compose: which of the losses were the excused
+    /// ones is not known, so they are assumed to overlap with the left-out
+    /// runs as much as they can (an overflow during an outage is the likely
+    /// case), and the report keeps `min(kept, lost - excused)`: it drops the
+    /// larger of the two exclusions, not their sum. Each rule alone excludes
+    /// no more than its own evidence, and together they never exclude more
+    /// than the larger, so the sum of two uncertain estimates cannot swallow
+    /// a repairable loss.
     pub(crate) fn on_report_excusing(
         &mut self,
         r: &LossReport,
         congested: bool,
         excused: u16,
+        limit: u32,
         now_us: u64,
     ) {
         let lost = f64::from(r.lost_pre_fec);
@@ -194,14 +342,25 @@ impl LossEstimator {
             }
         } else {
             let excused = excused.min(r.lost_pre_fec);
-            let kept = f64::from(r.lost_pre_fec - excused);
+            let split = split_runs(u32::from(r.lost_pre_fec), &r.loss_run_hist, limit);
+            let kept = split.kept.min(f64::from(r.lost_pre_fec - excused));
             self.lost += kept;
             self.lost_e += kept;
             self.losses_excused += u64::from(excused);
-            let share = if lost > 0.0 { kept / lost } else { 1.0 };
-            for (count, rep) in r.loss_run_hist.iter().zip(RUN_REPRESENTATIVES) {
-                self.runs += f64::from(*count) * share;
-                self.run_lost += f64::from(*count) * rep * share;
+            self.runs_unrepairable += split.runs_unrepairable;
+            self.losses_unrepairable += split.losses_unrepairable;
+            // The histogram of what is left: the runs under the limit, scaled
+            // by the share of their losses that the excuse did not take.
+            let share = if split.kept > 0.0 {
+                kept / split.kept
+            } else if lost > 0.0 {
+                0.0
+            } else {
+                1.0
+            };
+            for (count, rep) in split.runs.iter().zip(RUN_REPRESENTATIVES) {
+                self.runs += count * share;
+                self.run_lost += count * rep * share;
             }
         }
         self.reports += 1;
@@ -311,6 +470,10 @@ impl LossEstimator {
     pub(crate) fn congestion_skips(&self) -> u64 {
         self.congestion_skips
     }
+    /// Runs, and the losses in them, left out as longer than FEC can repair.
+    pub(crate) fn unrepairable(&self) -> (u64, u64) {
+        (self.runs_unrepairable, self.losses_unrepairable)
+    }
     /// Losses charged to the sender and kept out of `lost`.
     #[cfg(test)]
     pub(crate) fn losses_excused(&self) -> u64 {
@@ -387,6 +550,11 @@ pub(crate) struct FecAdapt {
     /// Changes of the live parameters the bridge applied (`note_applied`).
     changes: u64,
     last_applied: Option<FecBlockParams>,
+    /// The run limit the last report was read under.
+    last_limit: u32,
+    limit_hold: HeldLimit,
+    /// Source datagrams sealed per busy 20 ms, mean over the last 1 to 2 s.
+    sent: SourceRate,
 }
 
 impl FecAdapt {
@@ -407,6 +575,9 @@ impl FecAdapt {
             saturated: 0,
             changes: 0,
             last_applied: None,
+            last_limit: 0,
+            limit_hold: HeldLimit::default(),
+            sent: SourceRate::default(),
         }
     }
 
@@ -430,15 +601,56 @@ impl FecAdapt {
 
     /// [`Self::on_report`], `excused` of the report's losses being the
     /// stream's own queue overflow or quinn's local discards (`queue_loss`).
+    ///
+    /// Runs longer than FEC could repair at the block size the rate implies
+    /// are left out of the estimate ([`LossEstimator::on_report_excusing`]).
     pub(crate) fn on_report_excusing(
         &mut self,
         r: &LossReport,
         standing_queue: bool,
         excused: u16,
+        rate_bps: u64,
+        max_dg: usize,
         now_us: u64,
     ) {
+        let limit = self.run_limit(rate_bps, max_dg, now_us);
+        self.last_limit = limit;
         self.est
-            .on_report_excusing(r, standing_queue, excused, now_us);
+            .on_report_excusing(r, standing_queue, excused, limit, now_us);
+    }
+
+    /// A source datagram (a protected first send: not a pad, a
+    /// retransmission or a control frame) was sealed at `now_us`: the sender's
+    /// own rate, which bounds the block width the estimate alone does not (a
+    /// desktop sending 5 Mbit/s under a held 100 Mbit/s estimate has a block of
+    /// 26 sources, not 208). O(1).
+    pub(crate) fn note_sent(&mut self, now_us: u64) {
+        self.sent.note(now_us);
+    }
+
+    /// Source datagrams the rate tracker holds (tests).
+    #[cfg(test)]
+    pub(crate) fn sent_for_test(&self) -> u64 {
+        self.sent.held_for_test()
+    }
+
+    /// A new session: the previous client's send rate and held limit are not
+    /// the new one's. (The estimate itself is not reset here.)
+    pub(crate) fn reset_session(&mut self) {
+        self.sent = SourceRate::default();
+        self.limit_hold = HeldLimit::default();
+    }
+
+    /// The longest loss run FEC could be asked to repair at this rate: twice
+    /// the repair cap of the widest block the ladder can build (see
+    /// [`widest_block_sources`]), not of the notch it is in. A burst widens
+    /// the block, and measuring the burst needs the burst's runs in the
+    /// estimate. The width follows the rate the stream really sends: at most
+    /// the mean of source datagrams per busy 20 ms over the last 1 to 2 s.
+    /// Held at its peak for [`RUN_LIMIT_HOLD_US`].
+    fn run_limit(&mut self, rate_bps: u64, max_dg: usize, now_us: u64) -> u32 {
+        let k = widest_block_sources(rate_bps, max_dg).min(self.sent.mean(now_us).max(1));
+        self.limit_hold.hold(repairable_run_limit(k), now_us)
     }
 
     /// Time passes: decay, re-check the release, and read the declined
@@ -535,6 +747,9 @@ impl FecAdapt {
             changes: self.changes,
             floor_changes: self.est.state_changes(),
             congestion_skips: self.est.congestion_skips(),
+            runs_unrepairable: self.est.unrepairable().0,
+            losses_unrepairable: self.est.unrepairable().1,
+            run_limit: u64::from(self.last_limit),
             trim_steps: self.trim.steps(),
             blocks_sized: self.blocks_sized,
             saturated: self.saturated,
@@ -909,7 +1124,7 @@ mod tests {
         r.loss_run_hist[3] = 25;
         // Every loss excused: the datagrams are in `total`, nothing else.
         let mut a = LossEstimator::new();
-        a.on_report_excusing(&r, false, 100, 0);
+        a.on_report_excusing(&r, false, 100, u32::MAX, 0);
         assert_eq!(a.lost(), 0.0);
         assert_eq!(a.total(), 1000.0);
         assert_eq!(a.state(), FloorState::Clean);
@@ -917,22 +1132,22 @@ mod tests {
         assert_eq!(a.b_hat(), 1.0, "no run of an all-excused report is kept");
         // The same report unexcused engages.
         let mut b = LossEstimator::new();
-        b.on_report_excusing(&r, false, 0, 0);
+        b.on_report_excusing(&r, false, 0, u32::MAX, 0);
         assert_eq!(b.state(), FloorState::Engaged);
         // Part excused: the rest counts, the runs scale with it. 100 lost of
         // which 97 excused leaves 3: not enough to engage on its own.
         let mut c = LossEstimator::new();
-        c.on_report_excusing(&r, false, 97, 0);
+        c.on_report_excusing(&r, false, 97, u32::MAX, 0);
         assert_eq!(c.lost(), 3.0);
         assert_eq!(c.state(), FloorState::Clean);
         // More excused than lost is clamped to what was lost.
         let mut d = LossEstimator::new();
-        d.on_report_excusing(&r, false, 500, 0);
+        d.on_report_excusing(&r, false, 500, u32::MAX, 0);
         assert_eq!(d.lost(), 0.0);
         assert_eq!(d.losses_excused(), 100);
         // A congested report skips whole, and excuses nothing it did not need to.
         let mut e = LossEstimator::new();
-        e.on_report_excusing(&r, true, 40, 0);
+        e.on_report_excusing(&r, true, 40, u32::MAX, 0);
         assert_eq!(e.lost(), 0.0);
         assert_eq!(e.losses_excused(), 0);
     }
@@ -1014,5 +1229,428 @@ mod tests {
         // A congested interval is counted.
         a.on_report(&r, true, 6_000_000);
         assert_eq!(a.probe().congestion_skips, 1);
+    }
+
+    fn hist_report(received: u16, hist: [u16; 8], lost: u16) -> LossReport {
+        LossReport {
+            received,
+            lost_pre_fec: lost,
+            loss_run_hist: hist,
+            ..Default::default()
+        }
+    }
+
+    /// One outage: a single run of `gap` datagrams.
+    fn outage(gap: u16, received: u16) -> LossReport {
+        let mut h = [0u16; 8];
+        h[match gap {
+            1..=4 => gap as usize - 1,
+            5..=8 => 4,
+            9..=16 => 5,
+            17..=32 => 6,
+            _ => 7,
+        }] = 1;
+        hist_report(received, h, gap)
+    }
+
+    /// `rate_bps` of 1200 B datagrams from `from_us` to `to_us`, noted as the
+    /// bridge does: the sender's peak per 20 ms window is what `run_limit`
+    /// reads. Times only go forward, as in the bridge.
+    fn sending(a: &mut FecAdapt, rate_bps: u64, from_us: u64, to_us: u64) {
+        let gap_us = ((8.0 * 1200.0 * 1e6 / rate_bps as f64) as u64).max(1);
+        let mut t = from_us;
+        while t < to_us {
+            a.note_sent(t);
+            t += gap_us;
+        }
+    }
+
+    #[test]
+    fn the_run_limit_is_twice_the_repair_cap_of_the_block_with_a_floor() {
+        for (k, want) in [
+            (1u32, 4u32),
+            (4, 4),
+            (13, 8),
+            (21, 12),
+            (63, 32),
+            (128, 64),
+            (223, 64),
+        ] {
+            assert_eq!(repairable_run_limit(k), want, "k {k}");
+            assert!(repairable_run_limit(k) <= 64);
+        }
+        // Through the estimate, the stream sending at it (1200 B): the sources
+        // of a 20 ms window.
+        for (rate, want) in [
+            (2_000_000u64, 4u32), // k = 4
+            (10_000_000, 12),     // k = 21
+            (30_000_000, 32),     // k = 63
+            (100_000_000, 64),    // k = 208
+        ] {
+            let mut a = FecAdapt::new();
+            sending(&mut a, rate, 1_000_000, 2_000_000);
+            assert_eq!(a.run_limit(rate, 1200, 2_000_000), want, "{rate} bit/s");
+        }
+    }
+
+    #[test]
+    fn a_stream_sending_less_than_the_estimate_is_limited_by_what_it_sends() {
+        // 5 Mbit/s sent under a held 100 Mbit/s estimate: a block of about 10
+        // sources, so a limit of 6 to 8, not the 64 the estimate alone gives.
+        let mut a = FecAdapt::new();
+        sending(&mut a, 5_000_000, 1_000_000, 2_000_000);
+        let l = a.run_limit(100_000_000, 1200, 2_000_000);
+        assert!((4..=8).contains(&l), "limit {l}");
+        // The estimate below the stream still bounds it.
+        let mut b = FecAdapt::new();
+        sending(&mut b, 100_000_000, 1_000_000, 2_000_000);
+        assert_eq!(b.run_limit(5_000_000, 1200, 2_000_000), l);
+        // Nothing sent yet: the floor.
+        let mut c = FecAdapt::new();
+        assert_eq!(c.run_limit(100_000_000, 1200, 2_000_000), 4);
+    }
+
+    #[test]
+    fn the_limit_holds_its_peak_for_the_hold() {
+        let h = RUN_LIMIT_HOLD_US;
+        let mut l = HeldLimit::default();
+        assert_eq!(l.hold(12, 0), 12);
+        // Falls (the estimate was cut) and wobbles: held.
+        assert_eq!(l.hold(8, h / 10), 12);
+        assert_eq!(l.hold(9, h / 2), 12);
+        assert_eq!(l.hold(8, h - 1), 12);
+        // Rises: follows at once, and restarts the hold.
+        assert_eq!(l.hold(16, h), 16);
+        assert_eq!(l.hold(8, 2 * h - 1), 16);
+        // The hold passes: it falls to what the rate implies now.
+        assert_eq!(l.hold(8, 2 * h), 8);
+        assert_eq!(l.hold(8, 2 * h + 1), 8);
+        // Long enough to cover a forced close, a report and a round trip.
+        assert!(h >= 1_000_000 + 250_000 + 500_000);
+        // ... and short enough not to carry a burst past the mean's own 2 s.
+        assert!(h <= 5_000_000);
+    }
+
+    #[test]
+    fn a_cut_of_the_rate_near_a_bucket_edge_does_not_reclassify_a_run() {
+        // At 10 Mbit/s the limit is 12 (a run of 9-16 is kept), at 6 Mbit/s it
+        // is 8 (it is left out). A loss-driven cut of the estimate right after
+        // must not move the same run to the other side.
+        let mut a = FecAdapt::new();
+        sending(&mut a, 10_000_000, 1_000_000, 2_000_000);
+        let before = a.run_limit(10_000_000, 1200, 2_000_000);
+        let cut = a.run_limit(6_000_000, 1200, 2_500_000);
+        assert_eq!(before, 12);
+        assert_eq!(cut, before, "held");
+        // Without the hold the same two calls differ.
+        assert_ne!(repairable_run_limit(21), repairable_run_limit(13));
+    }
+
+    #[test]
+    fn the_source_rate_is_the_mean_of_the_busy_windows() {
+        let mut p = SourceRate::default();
+        assert_eq!(p.mean(0), 0);
+        // Windows of 30 and 10 datagrams alternate, with idle windows between:
+        // the mean is over the windows that held any (20), not the peak (30).
+        let w = SourceRate::WINDOW_US;
+        for i in 0..20u64 {
+            let at = 1_000_000 + i * 3 * w;
+            let n = if i % 2 == 0 { 30 } else { 10 };
+            for j in 0..n {
+                p.note(at + j * 10);
+            }
+        }
+        assert_eq!(p.mean(1_000_000 + 60 * w + 1), 20);
+        // Silence of any length leaves it where it was.
+        assert_eq!(p.mean(1_000_000 + 60 * w + 3_000_000), 20);
+        assert_eq!(p.mean(u64::MAX / 2), 20);
+    }
+
+    #[test]
+    fn one_burst_moves_the_mean_by_its_share_not_to_its_peak() {
+        // 16 per 20 ms, steadily, for 2 s; then one window of 200.
+        let mut p = SourceRate::default();
+        let w = SourceRate::WINDOW_US;
+        let mut t = 1_000_000;
+        for _ in 0..100 {
+            for j in 0..16 {
+                p.note(t + j * 100);
+            }
+            t += w;
+        }
+        assert_eq!(p.mean(t), 16);
+        for j in 0..200 {
+            p.note(t + j * 10);
+        }
+        t += w;
+        let m = p.mean(t + 1);
+        assert!((16..=24).contains(&m), "mean {m}, not the peak 200");
+    }
+
+    #[test]
+    fn an_outage_keeps_the_rate_and_the_burst_after_it_moves_it_by_its_share() {
+        let mut p = SourceRate::default();
+        let w = SourceRate::WINDOW_US;
+        let mut t = 1_000_000;
+        for _ in 0..100 {
+            for j in 0..17 {
+                p.note(t + j * 100);
+            }
+            t += w;
+        }
+        // Three seconds of silence, then the recovery burst fills one window.
+        t += 3_000_000;
+        for j in 0..40 {
+            p.note(t + j * 10);
+        }
+        let m = p.mean(t + w + 1);
+        assert!((17..=18).contains(&m), "mean {m}, not the burst's 40");
+    }
+
+    #[test]
+    fn the_rate_forgets_by_busy_windows() {
+        let mut p = SourceRate::default();
+        let w = SourceRate::WINDOW_US;
+        let mut t = 1_000_000;
+        for n in [40u64, 10] {
+            for _ in 0..2 * SourceRate::EPOCH_WINDOWS {
+                for j in 0..n {
+                    p.note(t + j * 10);
+                }
+                t += w;
+            }
+        }
+        assert_eq!(p.mean(t + 1), 10, "two epochs of 10 replaced the 40");
+    }
+
+    /// A stream that is not perfectly paced: bursts of 5 to 27 datagrams per
+    /// 20 ms window around a mean of 16 (781 datagrams/s, about 7.5 Mbit/s of
+    /// 1200 B), with a rare burst of 150. Returns the limit it gives under a
+    /// held 100 Mbit/s estimate.
+    fn bursty_limit() -> u32 {
+        let mut a = FecAdapt::new();
+        let w = SourceRate::WINDOW_US;
+        let mut t = 1_000_000u64;
+        let mut x = 7u64;
+        let end = t + 4_000_000;
+        let mut i = 0;
+        while t < end {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let n = if i % 97 == 50 {
+                150
+            } else {
+                5 + (x >> 33) % 23
+            };
+            for j in 0..n {
+                a.note_sent(t + j * 20);
+            }
+            t += w;
+            i += 1;
+        }
+        a.run_limit(100_000_000, 1200, t)
+    }
+
+    #[test]
+    fn a_bursty_application_limited_stream_gets_the_limit_of_its_mean() {
+        // Mean about 17: k 17, r_cap 5, limit 10. A peak would read the burst
+        // of 150 (limit 64); a 16 or 24 datagram outage must stay out.
+        let l = bursty_limit();
+        assert!((8..=12).contains(&l), "limit {l}");
+    }
+
+    #[test]
+    fn a_session_reset_forgets_the_rate_and_the_held_limit() {
+        let mut a = FecAdapt::new();
+        sending(&mut a, 100_000_000, 1_000_000, 2_000_000);
+        assert_eq!(a.run_limit(100_000_000, 1200, 2_000_000), 64);
+        a.reset_session();
+        // The new client has sent nothing yet: the floor, at once (not 64
+        // held, not 64 from the old rate).
+        assert_eq!(a.run_limit(100_000_000, 1200, 2_100_000), 4);
+    }
+
+    /// Datagrams of an outage: the stream's window in flight when the path
+    /// goes, `2 x R x (RTT + 5 ms)` with `R` the datagram rate.
+    fn outage_gap(rate_bps: u64, rtt_ms: u64) -> u16 {
+        let dg_per_s = rate_bps as f64 / (8.0 * 1200.0);
+        (2.0 * dg_per_s * (rtt_ms as f64 + 5.0) / 1000.0).ceil() as u16
+    }
+
+    #[test]
+    fn an_outage_alone_does_not_engage_or_move_any_estimate_at_any_rate() {
+        // The grid: the outage's gap follows from the rate and the RTT, as in
+        // the measured scenes (2M 16-21, 10M ~70, 30M ~200, 100M ~870 at
+        // 50 ms). Outages over the limit are the unrepairable ones: they must
+        // leave the estimator where it was. (Under it, the run is a burst FEC
+        // is for, and is read as one.)
+        let mut checked = 0;
+        for rate in [2_000_000u64, 10_000_000, 30_000_000, 100_000_000] {
+            for rtt in [5u64, 10, 20, 50, 100] {
+                let gap = outage_gap(rate, rtt);
+                let mut a = FecAdapt::new();
+                let mut t = 0u64;
+                sending(&mut a, rate, 0, 750_000);
+                let limit = a.run_limit(rate, 1200, 750_000);
+                if u32::from(gap) <= limit {
+                    // A short outage is a burst FEC can repair: not asserted.
+                    continue;
+                }
+                checked += 1;
+                for i in 0..40 {
+                    t += 250_000;
+                    sending(&mut a, rate, t - 250_000, t);
+                    // The outage's report, then clean ones.
+                    let r = if i == 3 { outage(gap, 20) } else { rep(400, 0) };
+                    a.on_report_excusing(&r, false, 0, rate, 1200, t);
+                }
+                let what = format!("{rate} bit/s, {rtt} ms, gap {gap}, limit {limit}");
+                let e = a.estimator();
+                assert_eq!(e.state(), FloorState::Clean, "{what}");
+                assert_eq!(e.state_changes(), 0, "{what}");
+                assert_eq!(e.p_hat(), 0.0, "{what}");
+                assert_eq!(e.b_hat(), 1.0, "{what}");
+                assert_eq!(e.unrepairable(), (1, u64::from(gap)), "{what}");
+                assert!(a.live_params(rate, 1200, 30, t).is_none(), "{what}");
+                let p = a.probe();
+                assert_eq!(
+                    (p.runs_unrepairable, p.losses_unrepairable),
+                    (1, u64::from(gap)),
+                    "{what}"
+                );
+            }
+        }
+        // The grid is not vacuous: every cell is an outage over the limit.
+        assert_eq!(checked, 20, "cells that reached the assertions");
+    }
+
+    #[test]
+    fn the_same_outage_engages_without_the_limit() {
+        // The control: the limit is what keeps the outage out, not the
+        // thresholds. (Runs over 32 are left out at any limit, so the control
+        // is the outages the histogram can place at or under 32.)
+        for (gap, rate_recv) in [(9u16, 20u16), (16, 20), (21, 20), (32, 20)] {
+            let mut e = LossEstimator::new();
+            e.on_report_excusing(&outage(gap, rate_recv), false, 0, u32::MAX, 0);
+            assert_eq!(e.state(), FloorState::Engaged, "gap {gap}");
+            assert!(e.p_hat() > 0.2 && e.b_hat() > 1.5);
+            let mut e = LossEstimator::new();
+            e.on_report_excusing(&outage(gap, rate_recv), false, 0, 4, 0);
+            assert_eq!(e.state(), FloorState::Clean, "gap {gap} at limit 4");
+        }
+    }
+
+    #[test]
+    fn a_report_mixing_short_and_long_runs_keeps_the_short_ones() {
+        // 6 single losses, one run of 3, and one outage of 870, over 4000.
+        let mut h = [0u16; 8];
+        h[0] = 6;
+        h[2] = 1;
+        h[7] = 1;
+        let r = hist_report(1000, h, 6 + 3 + 870);
+        let mut e = LossEstimator::new();
+        e.on_report_excusing(&r, false, 0, 4, 0);
+        // kept = min(879 - 33, 6 x 1 + 1 x 3) = 9.
+        assert_eq!(e.lost(), 9.0);
+        assert_eq!(e.total(), 1879.0);
+        assert_eq!(e.unrepairable(), (1, 870));
+        // b_hat reads the 7 kept runs (6 x 1 + 1 x 3 over 7), not the outage.
+        assert!((e.b_hat() - 9.0 / 7.0).abs() < 1e-9, "{}", e.b_hat());
+        // It still engages on the short losses alone (9 of 1879 > the floor).
+        assert_eq!(e.state(), FloorState::Engaged);
+    }
+
+    #[test]
+    fn a_run_at_the_limit_counts_and_one_bucket_above_does_not() {
+        // Limit 4: a run of 4 is repairable, the bucket 5-8 starts above it.
+        let mut at = LossEstimator::new();
+        at.on_report_excusing(&outage(4, 2000), false, 0, 4, 0);
+        assert_eq!((at.lost(), at.unrepairable()), (4.0, (0, 0)));
+        let mut above = LossEstimator::new();
+        above.on_report_excusing(&outage(5, 2000), false, 0, 4, 0);
+        assert_eq!((above.lost(), above.unrepairable()), (0.0, (1, 5)));
+        // A bucket that starts at or under the limit is kept whole, even if
+        // part of it is above: 5-8 at limit 6 or 8.
+        for limit in [5, 6, 8] {
+            let mut e = LossEstimator::new();
+            e.on_report_excusing(&outage(7, 2000), false, 0, limit, 0);
+            assert_eq!((e.lost(), e.unrepairable()), (7.0, (0, 0)), "limit {limit}");
+        }
+        // 9-16 starts above 8.
+        let mut e = LossEstimator::new();
+        e.on_report_excusing(&outage(12, 2000), false, 0, 8, 0);
+        assert_eq!((e.lost(), e.unrepairable()), (0.0, (1, 12)));
+    }
+
+    #[test]
+    fn the_bound_on_what_is_kept_never_goes_below_zero_or_past_the_losses() {
+        // The excluded minimum can exceed the report's losses if a stale
+        // histogram arrives: kept clamps at 0.
+        let mut h = [0u16; 8];
+        h[7] = 3;
+        let s = split_runs(10, &h, 4);
+        assert_eq!(
+            (s.kept, s.runs_unrepairable, s.losses_unrepairable),
+            (0.0, 3, 10)
+        );
+        // The >32 bucket is left out at any limit, so a report with two long
+        // runs does not keep one of them (70 + 70 at limit 42 kept 42 losses
+        // and engaged FEC).
+        let mut h = [0u16; 8];
+        h[7] = 2;
+        for limit in [4, 32, 42, 64] {
+            let s = split_runs(140, &h, limit);
+            assert_eq!(
+                (
+                    s.kept,
+                    s.runs_unrepairable,
+                    s.losses_unrepairable,
+                    s.runs[7]
+                ),
+                (0.0, 2, 140, 0.0),
+                "limit {limit}"
+            );
+        }
+        // A run of 17-32 beside a >32 run: the run of at most 32 is kept at a
+        // limit that admits it, whatever the total says.
+        let mut h = [0u16; 8];
+        h[6] = 1;
+        h[7] = 1;
+        let s = split_runs(100, &h, 40);
+        assert_eq!((s.kept, s.runs_unrepairable, s.runs[7]), (32.0, 1, 0.0));
+        assert_eq!(s.losses_unrepairable, 68);
+        // The left-out minimum is subtracted: a run of 5-8 and one of 9-16
+        // over 14 losses, limit 8. The run of 9-16 holds at least 9, so at
+        // most 5 are kept (the 5-8 bucket alone would allow 8).
+        let mut h = [0u16; 8];
+        h[4] = 1;
+        h[5] = 1;
+        let s = split_runs(14, &h, 8);
+        assert_eq!(
+            (s.kept, s.runs_unrepairable, s.losses_unrepairable),
+            (5.0, 1, 9)
+        );
+        // Nothing left out: all losses stay, whatever the histogram says.
+        let s = split_runs(50, &[0; 8], 4);
+        assert_eq!(s.kept, 50.0);
+    }
+
+    #[test]
+    fn excused_and_unrepairable_losses_are_dropped_once_not_added() {
+        // 5 singles + an outage of 100, 80 of the losses excused as queue
+        // overflow: kept = min(5, 105 - 80) = 5; not 5 - 80.
+        let mut h = [0u16; 8];
+        h[0] = 5;
+        h[7] = 1;
+        let r = hist_report(2000, h, 105);
+        let mut e = LossEstimator::new();
+        e.on_report_excusing(&r, false, 80, 4, 0);
+        assert_eq!(e.lost(), 5.0);
+        // 100 excused: the excuse alone leaves 5 as well; kept 5.
+        let mut e = LossEstimator::new();
+        e.on_report_excusing(&r, false, 103, 4, 0);
+        assert_eq!(e.lost(), 2.0, "min(5, 105 - 103)");
+        assert_eq!(e.losses_excused(), 103);
     }
 }

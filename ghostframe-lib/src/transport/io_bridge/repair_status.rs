@@ -125,8 +125,10 @@ impl IoBridge {
                     let excused =
                         self.queue_loss
                             .excuse(r.lost_pre_fec, r.last_bundle_seq, now_ms, queue);
+                    let rate = self.bwe.snapshot().bitrate_bps;
+                    let max_dg = self.live_max_dg().unwrap_or(1200);
                     if let Some(a) = self.fec_adapt.as_mut() {
-                        a.on_report_excusing(&r, queue, excused, now_us);
+                        a.on_report_excusing(&r, queue, excused, rate, max_dg, now_us);
                     }
                     self.adapt_step(now_us);
                 }

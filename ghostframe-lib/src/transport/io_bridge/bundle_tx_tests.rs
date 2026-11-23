@@ -796,6 +796,39 @@ async fn fec_off_sent_frames_match_the_r6c_golden() {
     assert_eq!((n, digest), (GOLDEN_FRAMES, GOLDEN_DIGEST));
 }
 
+/// The send-rate tracker behind the run limit counts bundles that would join a
+/// block: not pads, not control frames. The scene is the golden's.
+#[tokio::test]
+async fn the_run_limit_counts_only_protected_source_bundles() {
+    let mut b = framed_bridge();
+    b.set_fec_mode_for_test(crate::config::FecMode::Adaptive);
+    submit_tiles(&mut b, 10);
+    let now = now_std();
+    let template = bytes::Bytes::from(vec![7u8; 100]);
+    let probe = ProbeTag {
+        id: 1,
+        min_probes: 1,
+        min_bytes: 1,
+        bytes_sent_before: 0,
+    };
+    b.reliable_emitter.submit_h264_pad(&template, probe, now);
+    submit_tiles(&mut b, 4);
+    send_all(&mut b);
+    b.emit_frame_dimensions(3, 0, 160, 96);
+    b.send_pong_framed(H, &[0x05, 1, 2, 3]);
+    submit_tiles(&mut b, 7);
+    send_all(&mut b);
+    let n = b.sent_frames_for_test.len() as u64;
+    let counted = b.fec_adapt.as_ref().unwrap().sent_for_test();
+    assert!(counted > 0, "premise: tile bundles were counted");
+    // The scene sealed a pad bundle, a frame-dimensions frame and a pong
+    // besides the tiles: none of them is a source.
+    assert!(counted + 3 <= n, "counted {counted} of {n} frames");
+    // A new session starts the tracker over.
+    b.fire_session_reset(H);
+    assert_eq!(b.fec_adapt.as_ref().unwrap().sent_for_test(), 0);
+}
+
 /// Adaptive mode with nothing live is FEC off, byte for byte.
 #[tokio::test]
 async fn adaptive_with_no_live_params_matches_the_r6c_golden() {

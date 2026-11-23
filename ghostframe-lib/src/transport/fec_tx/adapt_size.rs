@@ -55,6 +55,84 @@ const T_MIN_MS: u32 = 5;
 const K_MIN: u32 = 64;
 const K_MAX: u32 = 223;
 
+/// Sources in the widest block the ladder can build at `rate_bps`: a
+/// `T_MAX_MS` window of `max_dg`-byte datagrams, at most `K_MAX` (the frame
+/// notch's 223 is the same bound). The ladder widens the block as the burst
+/// estimate rises, so this, not the narrow notch the `Clean` state is in, is
+/// what FEC could do for a burst once it adapts.
+pub(crate) fn widest_block_sources(rate_bps: u64, max_dg: usize) -> u32 {
+    let per_window =
+        (rate_bps as f64 * f64::from(T_MAX_MS) / 1000.0) / (8.0 * max_dg.max(1) as f64);
+    per_window.round().clamp(1.0, f64::from(K_MAX)) as u32
+}
+
+/// The sender's source datagrams per [`T_MAX_MS`] window: the mean over the
+/// windows that held any, over the last [`SourceRate::EPOCH_WINDOWS`] to twice
+/// that many of them. Aged by busy windows, not by time: an outage seals
+/// nothing, and a mean that emptied in the silence would be set by the first
+/// burst after it, which could make that outage's run look repairable. This is the width a block has when traffic flows (a block closes at
+/// `T_MAX_MS`, and an idle window closes none). A mean, not a peak: one burst
+/// (a repaint, an IDR) moves it by its share of a second, where a peak held the
+/// burst's width for the whole span and made an application-limited stream's
+/// outage look repairable. O(1) in time and space: two epochs of (datagrams,
+/// busy windows) and the window being filled.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SourceRate {
+    window_at_us: u64,
+    window: u32,
+    cur: (u64, u64),
+    prev: (u64, u64),
+}
+
+impl SourceRate {
+    pub(crate) const WINDOW_US: u64 = T_MAX_MS as u64 * 1_000;
+    /// Busy windows per epoch: one second of traffic at one window per 20 ms.
+    pub(crate) const EPOCH_WINDOWS: u64 = 50;
+
+    /// Roll the window up to `now_us`; a busy window that ends is folded into
+    /// the epoch, and a full epoch becomes the previous one. Silence moves
+    /// nothing.
+    fn roll(&mut self, now_us: u64) {
+        let behind = now_us.saturating_sub(self.window_at_us);
+        if behind >= Self::WINDOW_US {
+            if self.window > 0 {
+                self.cur.0 += u64::from(self.window);
+                self.cur.1 += 1;
+                if self.cur.1 >= Self::EPOCH_WINDOWS {
+                    self.prev = self.cur;
+                    self.cur = (0, 0);
+                }
+            }
+            self.window = 0;
+            self.window_at_us += behind / Self::WINDOW_US * Self::WINDOW_US;
+        }
+    }
+
+    /// One source datagram sealed at `now_us`.
+    pub(crate) fn note(&mut self, now_us: u64) {
+        self.roll(now_us);
+        self.window += 1;
+    }
+
+    /// Every datagram still in the two epochs and the open window (tests).
+    #[cfg(test)]
+    pub(crate) fn held_for_test(&self) -> u64 {
+        self.cur.0 + self.prev.0 + u64::from(self.window)
+    }
+
+    /// Datagrams per busy window over the last epochs (0 before any). With no
+    /// window finished yet, the one being filled.
+    pub(crate) fn mean(&mut self, now_us: u64) -> u32 {
+        self.roll(now_us);
+        let dg = self.cur.0 + self.prev.0;
+        let wins = self.cur.1 + self.prev.1;
+        if wins == 0 {
+            return self.window;
+        }
+        ((dg + wins / 2) / wins) as u32
+    }
+}
+
 /// Overhead cap of a block of `k` sources: `max(1, ceil(k / 4))`, for every
 /// `k` (a lift for `k < 4` makes `r` non-monotone in `k`), bounded by 32 and
 /// by `255 - k`.

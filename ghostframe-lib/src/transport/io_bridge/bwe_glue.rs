@@ -587,7 +587,8 @@ impl IoBridge {
         };
         // Held until the client's report counts a gap for it.
         let now_ms = self.bwe_ms(super::now_std());
-        if let Some(l) = self.loss_confirm.on_verdict(wire_seq, loss, now_ms) {
+        let newest = self.transmission_ledger.newest_recorded();
+        if let Some(l) = self.loss_confirm.on_verdict(wire_seq, loss, now_ms, newest) {
             self.confirm_loss(l);
         }
         self.loss_window
