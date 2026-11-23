@@ -48,6 +48,13 @@ pub struct WireLossStats {
     pub run_hist: [u64; 8],
     /// Longest settled loss run.
     pub max_run: u32,
+    /// Losses of the closed runs, the ones whose histogram bucket is written.
+    /// `lost_pre_fec - lost_in_runs` is the open run's share. A report reads
+    /// this, not `lost_pre_fec`, so that a run's losses and its length reach
+    /// the server in the same report. (A run reported before it closes would
+    /// send its later losses with no bucket, and the server could not tell
+    /// they were part of a long run.)
+    pub lost_in_runs: u64,
 }
 
 pub(crate) struct WireLossTracker {
@@ -92,8 +99,50 @@ impl WireLossTracker {
     fn close_run(&mut self) {
         if self.cur_run > 0 {
             self.stats.run_hist[bucket(self.cur_run)] += 1;
+            self.stats.lost_in_runs += u64::from(self.cur_run);
             self.stats.max_run = self.stats.max_run.max(self.cur_run);
             self.cur_run = 0;
+        }
+    }
+
+    /// Losses settled in the run still open (0 when none).
+    pub(crate) fn open_run(&self) -> u32 {
+        self.cur_run
+    }
+
+    /// Close the open run at its true length, for a caller that cannot wait
+    /// for the stream to settle it: settle the slots after the settled ones
+    /// that are lost, up to the first that arrived, then close. Every slot of
+    /// the run is known by then (the newest slot always arrived, so the run
+    /// ends at or before it), so its losses and its bucket enter the
+    /// statistics together at the length it really has. It is never cut in
+    /// two because time passed: the settled head and the unsettled tail are
+    /// one run. A datagram that turns up later in a slot settled here is
+    /// counted like any other too-old arrival (`late_after_declared`).
+    pub(crate) fn close_open_run(&mut self) {
+        if self.cur_run == 0 {
+            return;
+        }
+        while self.has_unsettled() && !*self.slot(self.settled_next) {
+            self.settle_one();
+        }
+        self.close_run();
+    }
+
+    /// Slots from `settled_next` through the newest are still waiting out the
+    /// reorder window.
+    pub(crate) fn has_unsettled(&self) -> bool {
+        self.newest
+            .is_some_and(|n| (n.wrapping_sub(self.settled_next) as i32) >= 0)
+    }
+
+    /// Settle everything through the newest slot now, closing the run it ends.
+    /// For a caller that has heard nothing for long enough that no datagram of
+    /// the window is still in flight; a late arrival into a slot settled here
+    /// is a too-old arrival (`late_after_declared`), as after any settle.
+    pub(crate) fn settle_all(&mut self) {
+        while self.has_unsettled() {
+            self.settle_one();
         }
     }
 
@@ -375,5 +424,126 @@ mod tests {
             }
         }
         assert_eq!(t.stats().lost_pre_fec, 1);
+    }
+
+    /// `lost_in_runs` is the losses of closed runs: an open run's losses are
+    /// counted as lost but are not in a run, and arrive with it when it closes.
+    #[test]
+    fn lost_in_runs_waits_for_the_run_to_close_whatever_its_length() {
+        for len in [10u32, 40, 100] {
+            let mut t = WireLossTracker::new();
+            for s in 0..100 {
+                t.on_received(s);
+            }
+            // 100..100+len lost; the stream carries on until just short of the
+            // run's close, then past it.
+            let mut open_seen = 0;
+            for s in (100 + len)..(100 + len + 200) {
+                t.on_received(s);
+                let st = t.stats();
+                if st.lost_pre_fec > 0 && st.lost_in_runs == 0 {
+                    open_seen += 1;
+                    assert_eq!(st.run_hist, [0; 8], "len {len}: not in the histogram yet");
+                }
+            }
+            assert!(
+                open_seen > 0 || len <= 1,
+                "len {len}: observed the run open"
+            );
+            let st = t.stats();
+            assert_eq!(
+                (st.lost_pre_fec, st.lost_in_runs),
+                (u64::from(len), u64::from(len))
+            );
+            assert_eq!(st.run_hist.iter().sum::<u64>(), 1, "one run, counted once");
+        }
+    }
+
+    #[test]
+    fn an_open_run_closed_early_is_one_run_at_its_true_length() {
+        let mut t = WireLossTracker::new();
+        for s in 0..100 {
+            t.on_received(s);
+        }
+        // 100..=199 lost, 230 sent: 65 of the lost settled, the run open, the
+        // other 35 waiting in the reorder window behind it.
+        for s in 200..230 {
+            t.on_received(s);
+        }
+        assert_eq!(t.open_run(), 65);
+        let before = t.stats();
+        assert_eq!((before.lost_in_runs, before.run_hist), (0, [0; 8]));
+        t.close_open_run();
+        let st = t.stats();
+        assert_eq!(
+            (st.lost_in_runs, st.run_hist[7]),
+            (100, 1),
+            "one run of 100"
+        );
+        assert_eq!(st.lost_pre_fec, 100);
+        assert_eq!(t.open_run(), 0);
+        t.close_open_run();
+        assert_eq!(t.stats(), st, "closing nothing changes nothing");
+        // Traffic carries on: nothing of the run is counted again.
+        for s in 230..400 {
+            t.on_received(s);
+        }
+        let st = t.stats();
+        assert_eq!((st.lost_pre_fec, st.lost_in_runs), (100, 100));
+        assert_eq!(st.run_hist.iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn settle_all_closes_a_gap_that_never_opened_a_run() {
+        let mut t = WireLossTracker::new();
+        for s in 0..100 {
+            t.on_received(s);
+        }
+        // 100..120 lost (20), then 10 arrivals: all inside the reorder window.
+        for s in 120..130 {
+            t.on_received(s);
+        }
+        assert_eq!((t.open_run(), t.stats().lost_pre_fec), (0, 0));
+        t.settle_all();
+        let st = t.stats();
+        assert_eq!(
+            (st.lost_pre_fec, st.lost_in_runs, st.run_hist[6]),
+            (20, 20, 1)
+        );
+        assert!(!t.has_unsettled());
+        // A datagram of the gap turning up now is a too-old arrival: the
+        // loss stays counted, the arrival is counted once.
+        let received = st.received;
+        t.on_received(110);
+        let st = t.stats();
+        assert_eq!(
+            (st.late_after_declared, st.lost_pre_fec, st.received),
+            (1, 20, received + 1)
+        );
+        // New traffic continues cleanly.
+        for s in 130..300 {
+            t.on_received(s);
+        }
+        let st = t.stats();
+        assert_eq!((st.lost_pre_fec, st.run_hist.iter().sum::<u64>()), (20, 1));
+    }
+
+    #[test]
+    fn a_jump_run_is_in_the_histogram_once_it_closes() {
+        let mut t = WireLossTracker::new();
+        for s in 0..100 {
+            t.on_received(s);
+        }
+        t.on_received(100 + 1000);
+        let st = t.stats();
+        // 936 of the 1000 settled; the run is open.
+        assert_eq!(st.lost_pre_fec, 1001 - 1 - REORDER_WINDOW as u64);
+        assert_eq!((st.lost_in_runs, st.run_hist), (0, [0; 8]));
+        for s in 1101..1300 {
+            t.on_received(s);
+        }
+        let st = t.stats();
+        assert_eq!((st.lost_pre_fec, st.lost_in_runs), (1000, 1000));
+        assert_eq!(st.run_hist, [0, 0, 0, 0, 0, 0, 0, 1]);
     }
 }
