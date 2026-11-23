@@ -39,6 +39,12 @@ pub struct FecAdaptProbe {
     /// also counts span moves while engaged.
     pub floor_changes: u64,
     pub congestion_skips: u64,
+    /// Loss runs (and the losses in them) left out of the estimate because
+    /// they were longer than FEC could repair, cumulative; and the longest
+    /// run it would repair, as of the last report.
+    pub runs_unrepairable: u64,
+    pub losses_unrepairable: u64,
+    pub run_limit: u64,
     pub trim_steps: u64,
     pub blocks_sized: u64,
     pub saturated: u64,

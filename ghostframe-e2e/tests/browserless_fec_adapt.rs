@@ -2584,13 +2584,24 @@ const OUTAGE_WINDOW_MS: u64 = 20_000;
 
 /// A clean sweep cell, with the outage as a step in the server-to-client
 /// loss and a total cap of zero on the client-to-server path.
+///
+/// `rtt_ms` replaces the grid's 50 ms round trip, and `scale` is the offered
+/// load (`sweep_scene`'s): under 1 the stream is application-limited, sending
+/// less than the estimate the cap allows.
 fn outage_scene(
     cap: u64,
     seed: u64,
     ms: u64,
     outage_ms: Option<u64>,
+    rtt_ms: u64,
+    scale: f64,
 ) -> (BrowserlessScene, LinkOverrides) {
-    let (scene, mut links) = sweep_scene(Cell::new(Load::H264, Loss::Clean, cap), seed, ms, 1.0);
+    let (mut scene, mut links) =
+        sweep_scene(Cell::new(Load::H264, Loss::Clean, cap), seed, ms, scale);
+    scene.net.delay_us = rtt_ms * 500;
+    if let Some(p) = links.s2c.as_mut() {
+        p.delay_us = rtt_ms * 500;
+    }
     let (from, to) = (
         OUTAGE_AT_MS * 1000,
         (OUTAGE_AT_MS + outage_ms.unwrap_or(0)) * 1000,
@@ -2601,7 +2612,7 @@ fn outage_scene(
         points = vec![(0, u64::MAX), (from, 0), (to, u64::MAX)];
     }
     links.c2s = Some(NetProfile {
-        delay_us: 25_000,
+        delay_us: rtt_ms * 500,
         cap: CapTimeline { points },
         ..NetProfile::perfect()
     });
@@ -2630,6 +2641,15 @@ struct OutSnap {
     local_losses: u64,
     skips: u64,
     floor_changes: u64,
+    /// Runs, and the losses in them, the estimator left out as longer than
+    /// FEC could repair; the run limit it read the last report under.
+    runs_unrepairable: u64,
+    losses_unrepairable: u64,
+    run_limit: u64,
+    /// Losses goog_cc was told of (the client confirmed them) and the verdicts
+    /// that expired unconfirmed.
+    confirmed: u64,
+    unconfirmed: u64,
     shown: usize,
     late: usize,
     never_fed: usize,
@@ -2686,6 +2706,11 @@ fn out_snap(r: &BrowserlessResult, ck_ms: u64, outage_ms: u64) -> OutSnap {
         local_losses: a.local_losses,
         skips: a.congestion_skips,
         floor_changes: a.floor_changes,
+        runs_unrepairable: a.runs_unrepairable,
+        losses_unrepairable: a.losses_unrepairable,
+        run_limit: a.run_limit,
+        confirmed: i.ledger_loss_class_confirmed.iter().sum(),
+        unconfirmed: i.ledger_loss_class_unconfirmed.iter().sum(),
         shown,
         late,
         never_fed,
@@ -2697,7 +2722,19 @@ fn out_snap(r: &BrowserlessResult, ck_ms: u64, outage_ms: u64) -> OutSnap {
 }
 
 async fn out_run(cap: u64, seed: u64, arm: Arm, outage_ms: Option<u64>, ck_ms: u64) -> OutSnap {
-    let (scene, links) = outage_scene(cap, seed, ck_ms, outage_ms);
+    out_run_with(cap, seed, arm, outage_ms, ck_ms, 50, 1.0).await
+}
+
+async fn out_run_with(
+    cap: u64,
+    seed: u64,
+    arm: Arm,
+    outage_ms: Option<u64>,
+    ck_ms: u64,
+    rtt_ms: u64,
+    scale: f64,
+) -> OutSnap {
+    let (scene, links) = outage_scene(cap, seed, ck_ms, outage_ms, rtt_ms, scale);
     let r = run_browserless_with_options(scene, links, arm.options())
         .await
         .expect("scene ran");
@@ -2707,7 +2744,8 @@ async fn out_run(cap: u64, seed: u64, arm: Arm, outage_ms: Option<u64>, ck_ms: u
          b_hat_x100={} r8={} r64={} k_max={} t_ms={} src_bytes={} repair_bytes={} dropped={} \
          lost_pre_fec={} recovered={} retx={} excused={} queue_losses={} local_losses={} skips={} \
          floor_changes={} shown={} late={} never_fed={} win_shown={} win_est_bps={:.0} \
-         show_us={}..{}",
+         show_us={}..{} runs_unrep={} losses_unrep={} run_limit={} confirmed={} unconfirmed={} \
+         rtt={rtt_ms} scale={scale}",
         arm.name(),
         outage_ms.is_some(),
         s.engaged,
@@ -2734,7 +2772,12 @@ async fn out_run(cap: u64, seed: u64, arm: Arm, outage_ms: Option<u64>, ck_ms: u
         s.win_shown,
         s.win_est_bps,
         s.first_show_us,
-        s.last_show_us
+        s.last_show_us,
+        s.runs_unrepairable,
+        s.losses_unrepairable,
+        s.run_limit,
+        s.confirmed,
+        s.unconfirmed
     );
     s
 }
@@ -2825,6 +2868,118 @@ async fn one_short_outage_on_a_clean_link() {
                         "never_engaged"
                     }
                 ),
+            }
+        }
+    }
+}
+
+/// One 300 ms outage on a clean link does not engage FEC: a run that long is
+/// past what a block can repair, so the resend path owns it (the owner's
+/// requirement: "that long is already past the benefit of FEC"). Read three
+/// seconds after the outage, where the report-only scene above sees engagement
+/// on the 15 s to 35 s scale. The cells: 10 Mbit/s at 50 ms (the gap there is
+/// about 70 datagrams); low round trips (30 Mbit/s at 10 ms, 100 Mbit/s at
+/// 5 ms), where the gap is 40 to 200 and a limit of two blocks of sources let
+/// the lower ones through; and an application-limited stream (a twentieth of
+/// the load under a 100 Mbit/s cap), where the gap follows what is sent.
+#[tokio::test(start_paused = true)]
+async fn one_short_outage_does_not_engage_fec() {
+    for (cap, rtt_ms, scale) in [
+        (10u64, 50u64, 1.0f64),
+        (30, 10, 1.0),
+        (100, 5, 1.0),
+        (100, 50, 0.05),
+        // Application-limited at about 7.5 Mbit/s under a held 100 Mbit/s
+        // estimate, at low round trips (blocks of about 17, a limit of 12).
+        (100, 10, 0.045),
+        (100, 5, 0.045),
+    ] {
+        assert_outage_stays_out(cap, rtt_ms, scale, 300, 20).await;
+    }
+}
+
+/// The same at the size the limit is for: an application-limited stream at
+/// about 8 Mbit/s loses 21 to 23 datagrams in a short outage (10 ms at a 10 ms
+/// round trip, 40 ms at 5 ms; the stream is frame-paced, so a shorter outage
+/// can fall between frames and lose none). Its blocks are about 17 sources
+/// wide and its limit 12. A limit read off bursts and retransmissions (64)
+/// kept that run and engaged FEC.
+#[tokio::test(start_paused = true)]
+async fn a_21_to_23_datagram_outage_at_an_application_limited_stream_does_not_engage_fec() {
+    for (rtt_ms, outage) in [(10u64, 10u64), (5, 40)] {
+        let s = assert_outage_stays_out(100, rtt_ms, 0.045, outage, 13).await;
+        assert!(
+            s.run_limit <= 12,
+            "rtt {rtt_ms}: the limit follows what is sent, not bursts: {s:?}"
+        );
+    }
+}
+
+async fn assert_outage_stays_out(
+    cap: u64,
+    rtt_ms: u64,
+    scale: f64,
+    outage: u64,
+    min_losses: u64,
+) -> OutSnap {
+    let seed = SWEEP_SEEDS[0];
+    let ck = OUTAGE_AT_MS + outage + 3_000;
+    let what = format!("{cap} Mbit/s, {rtt_ms} ms, scale {scale}, outage {outage} ms");
+    let s = out_run_with(cap, seed, Arm::Adaptive, Some(outage), ck, rtt_ms, scale).await;
+    // Non-vacuity: the outage was a long run the estimator saw and left out.
+    assert!(
+        s.runs_unrepairable >= 1 && s.losses_unrepairable >= min_losses,
+        "{what}: the outage must reach the estimator as an unrepairable run: {s:?}"
+    );
+    assert!(
+        s.run_limit > 0 && s.run_limit < s.losses_unrepairable,
+        "{what}: {s:?}"
+    );
+    assert!(!s.engaged, "{what}: FEC engaged on an outage: {s:?}");
+    assert_eq!(s.floor_changes, 0, "{what}: {s:?}");
+    assert_eq!(s.repair_bytes, 0, "{what}: no repair was sent: {s:?}");
+    assert_eq!(s.p_hat_ppm, 0, "{what}: {s:?}");
+    // goog_cc is still told: the losses the client counted reach it.
+    assert!(
+        s.confirmed >= s.lost_pre_fec,
+        "{what}: goog_cc heard {} of the client's {}: {s:?}",
+        s.confirmed,
+        s.lost_pre_fec
+    );
+    s
+}
+
+/// An outage long enough to outlast any time-based rate: nothing is sealed for
+/// three seconds, and the recovery burst after it must not read as the
+/// stream's rate and make the outage's run look repairable.
+#[tokio::test(start_paused = true)]
+async fn a_three_second_outage_of_an_application_limited_stream_does_not_engage_fec() {
+    let s = assert_outage_stays_out(100, 10, 0.045, 3_000, 13).await;
+    assert!(s.run_limit <= 12, "the limit kept the stream's rate: {s:?}");
+}
+
+/// Report only: the outage at a grid of rates and round trips, the arm and the
+/// numbers the review asks for (engagement, repair overhead, and how many of
+/// the gap's losses goog_cc was told of: `confirmed` against `dropped`).
+#[tokio::test(start_paused = true)]
+#[ignore = "report only: prints FECOUT lines"]
+async fn outage_grid_report() {
+    let caps = env_list("GHOSTFRAME_FEC_OUTAGE_CAPS", &[2, 10, 30, 100]);
+    let rtts = env_list("GHOSTFRAME_FEC_OUTAGE_RTTS", &[5, 10, 20, 50]);
+    let n = env_list("GHOSTFRAME_FEC_OUTAGE_SEEDS", &[3])[0].clamp(1, 5) as usize;
+    let outage = env_list("GHOSTFRAME_FEC_OUTAGE_MS", &[300])[0];
+    let ck = OUTAGE_AT_MS + outage + 3_000;
+    for &seed in &SWEEP_SEEDS[..n] {
+        for &cap in &caps {
+            for &rtt in &rtts {
+                out_run_with(cap, seed, Arm::Adaptive, Some(outage), ck, rtt, 1.0).await;
+            }
+        }
+        // Application-limited under a 100 Mbit/s cap: 7.5 Mbit/s (scale
+        // 0.045), 5 Mbit/s (0.05) and a slow 2 Mbit/s stream (0.02).
+        for scale in [0.045f64, 0.05, 0.02] {
+            for &rtt in &rtts {
+                out_run_with(100, seed, Arm::Adaptive, Some(outage), ck, rtt, scale).await;
             }
         }
     }

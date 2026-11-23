@@ -481,28 +481,43 @@ async fn the_frame_notch_helps_at_150_mbit_burst_8() {
 /// burst: the run with the notch allowed is the run without it, datagram for
 /// datagram. (The loss is as bursty as at 150 Mbit/s b8, so the burst estimate
 /// is over the entry and only the rate keeps the notch out.)
+///
+/// 50 Mbit/s with a mean burst of 10, not 10 Mbit/s with 8: the estimator
+/// leaves out the runs FEC could not repair (`2 x r_cap(k)` at most), and at
+/// 10 Mbit/s that limit is 12, under the 17-32 runs a mean burst of 8 has in
+/// the tail. The burst estimate then reads 2.9, not over the entry, and the
+/// premise is lost to the owner's rule (do not count what FEC cannot repair).
+/// At 50 Mbit/s the limit is 52 (a block of 104), the tail is kept, and a
+/// frame (fill 0.82) still fits one 255-symbol block with the frame notch's
+/// repair share. Margins, not edges: the burst estimate is 7.0 to 9.7 against
+/// the entry 6.0 on the three seeds (a burst of 8 read 5.1 on the first), and
+/// the fill is 18 % under one block (60 Mbit/s was 2 % under). The unit walk
+/// in `adapt_size.rs` proves the rule for a burst estimate up to 12 at any
+/// rate.
 #[tokio::test(start_paused = true)]
 async fn a_frame_that_fits_one_block_never_enters_the_frame_notch() {
     let cell = Cell {
-        cap_mbit: 10,
-        run: 8,
+        cap_mbit: 50,
+        run: 10,
     };
-    let a = run(cell, SEEDS[0], 8, Arm::Frame).await;
-    let b = run(cell, SEEDS[0], 8, Arm::Single).await;
-    assert!(
-        a.engaged && a.dropped > 20 && a.sized > 10,
-        "premise: engaged and lossy"
-    );
-    assert!(
-        a.b_hat_x100 > ENTER_X100,
-        "premise: b_hat {} is over the entry",
-        a.b_hat_x100
-    );
-    assert_eq!(a.frame_entries, 0);
-    assert_eq!(
-        a.digest, b.digest,
-        "the notch arm is the control, byte for byte"
-    );
+    for &seed in &SEEDS[..3] {
+        let a = run(cell, seed, 8, Arm::Frame).await;
+        let b = run(cell, seed, 8, Arm::Single).await;
+        assert!(
+            a.engaged && a.dropped > 20 && a.sized > 10,
+            "premise: engaged and lossy"
+        );
+        assert!(
+            a.b_hat_x100 > ENTER_X100,
+            "premise: b_hat {} is over the entry (seed {seed:#x})",
+            a.b_hat_x100
+        );
+        assert_eq!(a.frame_entries, 0, "seed {seed:#x}");
+        assert_eq!(
+            a.digest, b.digest,
+            "the notch arm is the control, byte for byte (seed {seed:#x})"
+        );
+    }
 }
 
 /// The grid, behind `GHOSTFRAME_FEC_SWEEP=full`: 150 and 200 Mbit/s at bursts

@@ -322,8 +322,29 @@ impl IoBridge {
         ok
     }
 
+    /// Does the bundle carry a first send a block protects (or would, with
+    /// blocks live)? A pad never does.
+    pub(super) fn is_source_bundle(b: &SealedBundle) -> bool {
+        b.records.iter().any(|r| r.protect && !r.is_pad)
+    }
+
     /// Record each sealed bundle in the ledger and queue it for quinn.
     pub(super) fn queue_bundles(&mut self, sealed: SmallVec<[SealedBundle; 2]>) {
+        if self.fec_adapt.is_some() {
+            // The sender's own rate: it bounds the block width the estimate
+            // alone does not (see `FecAdapt::note_sent`). Only a bundle that
+            // would join a block counts, whether or not blocks are live: a
+            // pad, a retransmission and a control frame never do, and
+            // counting them read a stream sending 7.5 Mbit/s as one with
+            // twice the block width.
+            let now_us = self.reliable_emitter.emit_us64(now_std());
+            let sources = sealed.iter().filter(|b| Self::is_source_bundle(b)).count();
+            if let Some(a) = self.fec_adapt.as_mut() {
+                for _ in 0..sources {
+                    a.note_sent(now_us);
+                }
+            }
+        }
         for b in sealed {
             self.record_bundle(&b);
             self.note_source_sealed(&b);
