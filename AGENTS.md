@@ -297,8 +297,8 @@ estimate is not reliably application-limited to goog_cc's ALR detector (it
 spends the detector's 80 % budget as fast as it refills), so the bridge no
 longer pretends otherwise: there is no `alr_signalled` (it was removed; grep
 finds it only in old plans). The application starts probe clusters of its own
-(`app_probes`, `h264_start_app_probe`: twice the estimate every interval,
-chained while they succeed) and
+(`app_probes`, `h264_start_app_probe`: every interval, 2.5 x the estimate for 65 ms
+under 4 Mbit/s and 2 x for 100 ms otherwise, chained at 2 x while they succeed) and
 fills the probe windows goog_cc asks for with padding when no IDR is due:
 copies of an acknowledged P-frame fragment under new `wire_seq`s
 (`probe_padding_windows` / `probe_padding_bytes`; the client acknowledges and
@@ -316,8 +316,8 @@ meter, `bwe/probe_meter.rs`, read once per feedback in receive order) or by
 being published while saturated (bounded by the ceiling); rises up to a proved
 rate (the way back after a cut) are free, and only a feedback earns unprobed
 growth credit. A hard hold above the proved rate was tried and slowed the step-up
-median from 1.1 s to 5.7 s; the shipped gate's is 2.0 s (why, and why the app
-probe stays at 2 x: `docs/design/h264-transport.md` section 5).
+median from 1.1 s to 5.7 s; the shipped gate's is 2.0 s (why, and the app
+probe's shape: `docs/design/h264-transport.md` section 5).
 `growth_probe_proofs` / `growth_probe_proved_max_bps` count what the meter
 proved.
 `growth_held` (feedbacks where the limit bound) /

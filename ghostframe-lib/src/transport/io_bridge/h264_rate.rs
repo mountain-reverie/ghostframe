@@ -134,9 +134,54 @@ const APP_PROBE_DURATION: Duration = Duration::from_millis(100);
 /// The shortest cluster worth sending (goog_cc's own shortest is 15 ms).
 const APP_PROBE_MIN_DURATION: Duration = Duration::from_millis(15);
 const APP_PROBE_MIN_PROBES: i64 = 5;
+/// The first application probe of a chain, at a low estimate, targets this
+/// multiple of it. It is the one that proves a capacity step: it can show about
+/// this multiple of the pre-step value, and a step is found once the estimate
+/// reaches 0.8 of the new capacity. At 2x a 2 -> 6 Mbit/s step cleared
+/// 4.8 Mbit/s at once only when the pre-step estimate had drifted to 1.2 x the
+/// old link.
+const APP_PROBE_FIRST_MULTIPLE: f64 = 2.5;
+/// Every other application probe targets this multiple. A chained probe only
+/// follows a rise the first already proved, so it needs no more reach.
+const APP_PROBE_CHAIN_MULTIPLE: f64 = 2.0;
+/// The high first probe is shorter: on a link with no spare capacity it queues
+/// `(2.5 - 1) x 65 ms`, no more than a 2x probe's `(2 - 1) x 100 ms`. At 100 ms
+/// it delayed frames by up to 209 ms at the next probe after a capacity drop.
+const APP_PROBE_FIRST_DURATION: Duration = Duration::from_millis(65);
+/// The estimate under which a first probe takes that shape. From about
+/// 4.5 Mbit/s the short probe left the estimate under 0.9 of the FEC-off run
+/// on a 16 Mbit/s link with 5 % loss (`browserless_fec_rate`).
+const APP_PROBE_FIRST_BELOW_BPS: u64 = 4_000_000;
+// Both shapes, padding margin included, fit `PAD_MAX_ESTIMATE_SECS`.
+const _: () = assert!(
+    APP_PROBE_FIRST_MULTIPLE * APP_PROBE_FIRST_DURATION.as_secs_f64() * PAD_MARGIN
+        <= PAD_MAX_ESTIMATE_SECS + 1e-9
+);
+const _: () = assert!(
+    APP_PROBE_CHAIN_MULTIPLE * APP_PROBE_DURATION.as_secs_f64() * PAD_MARGIN
+        <= PAD_MAX_ESTIMATE_SECS + 1e-9
+);
 /// The application's cluster ids start here; goog_cc counts up from 1 and would
 /// need a billion probes to meet them.
 const APP_PROBE_ID_BASE: i32 = 1_000_000_000;
+
+/// The rate and length of the next application probe: the first of a chain
+/// under [`APP_PROBE_FIRST_BELOW_BPS`] is [`APP_PROBE_FIRST_MULTIPLE`] for
+/// [`APP_PROBE_FIRST_DURATION`], every other one
+/// [`APP_PROBE_CHAIN_MULTIPLE`] for [`APP_PROBE_DURATION`].
+fn app_probe_shape(est: u64, chain_len: u32) -> (u64, Duration) {
+    if chain_len == 0 && est < APP_PROBE_FIRST_BELOW_BPS {
+        (
+            (est as f64 * APP_PROBE_FIRST_MULTIPLE) as u64,
+            APP_PROBE_FIRST_DURATION,
+        )
+    } else {
+        (
+            (est as f64 * APP_PROBE_CHAIN_MULTIPLE) as u64,
+            APP_PROBE_DURATION,
+        )
+    }
+}
 
 /// The application's own probing (see `h264_start_app_probe`).
 #[derive(Debug, Default, Clone, Copy)]
@@ -520,7 +565,7 @@ impl IoBridge {
     /// 40 % budget), and a rate-capped stream at 0.8 x its estimate spends the
     /// budget as fast as it refills, so it does not reliably ask. The stream *is*
     /// application-limited in the sense that matters (it chose not to send
-    /// more), so the application probes: a cluster at twice the estimate every
+    /// more), so the application probes: a cluster shaped by [`app_probe_shape`] every
     /// [`APP_PROBE_INTERVAL`], and, while a probe keeps succeeding (the
     /// estimate reached 0.7 x its target), the next one straight after, as
     /// goog_cc chains its own. The cluster has an id from a range goog_cc never
@@ -554,17 +599,17 @@ impl IoBridge {
             p.next_at = Some(now + APP_PROBE_INTERVAL);
             return;
         }
-        let target = est.saturating_mul(2);
+        let (target, base_duration) = app_probe_shape(est, p.chain_len);
         // The cluster is sized to what padding can fill: `want = 1.2 x
         // min_bytes` must fit under `PAD_MAX_BYTES` (and under 0.3 s of the
-        // estimate, which the 2x multiplier and the 100 ms window satisfy), or
+        // estimate, which both shapes of `app_probe_shape` satisfy), or
         // the estimator, which needs 80 % of `min_bytes` acknowledged, could
         // never produce a result: at 30 Mbit/s a 100 ms cluster is 750 kB
         // against a 384 kB cap. A higher estimate gets a shorter window instead;
         // one that would need under `APP_PROBE_MIN_DURATION` is skipped, and
         // counted.
         let max_duration = (PAD_MAX_BYTES as f64 / PAD_MARGIN) / (target as f64 / 8.0);
-        let duration = APP_PROBE_DURATION.min(Duration::from_secs_f64(max_duration));
+        let duration = base_duration.min(Duration::from_secs_f64(max_duration));
         if duration < APP_PROBE_MIN_DURATION {
             self.h264.stats.app_probes_skipped += 1;
             let p = &mut self.h264.app_probe;
@@ -894,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn the_application_probes_at_twice_the_estimate_every_five_seconds() {
+    async fn the_application_probes_at_two_and_a_half_times_the_estimate_every_five_seconds() {
         let mut b = padding_bridge().await;
         let est = b.bwe.snapshot().bitrate_bps;
         // The first look arms the cadence; the start-up ladder is goog_cc's.
@@ -911,11 +956,13 @@ mod tests {
             "an id goog_cc never issues: {}",
             p.id
         );
-        assert_eq!(p.target_rate_bps, est * 2);
+        // A literal, so a change to the constant fails here.
+        assert_eq!(p.target_rate_bps, (est as f64 * 2.5) as u64);
         assert_eq!(p.min_probes, APP_PROBE_MIN_PROBES);
         assert_eq!(
             p.min_bytes,
-            (p.target_rate_bps as f64 / 8.0 * APP_PROBE_DURATION.as_secs_f64()) as i64
+            // A literal: the first probe of a chain lasts 65 ms.
+            (p.target_rate_bps as f64 / 8.0 * 0.065) as i64
         );
         assert_eq!(b.h264.stats.app_probes, 1);
         // Filled with padding, tagged for this cluster, never past the cluster
@@ -939,6 +986,18 @@ mod tests {
         );
         // Never counted as frame data.
         assert_eq!(b.h264.stats.frames_sent, 0);
+    }
+
+    #[test]
+    fn only_a_first_probe_at_a_low_estimate_is_short_and_high() {
+        let short = Duration::from_millis(65);
+        let long = Duration::from_millis(100);
+        assert_eq!(app_probe_shape(2_000_000, 0), (5_000_000, short));
+        assert_eq!(app_probe_shape(3_999_999, 0).1, short);
+        // A chained probe, and any probe from 4 Mbit/s, is 2x for 100 ms.
+        assert_eq!(app_probe_shape(2_000_000, 1), (4_000_000, long));
+        assert_eq!(app_probe_shape(4_000_000, 0), (8_000_000, long));
+        assert_eq!(app_probe_shape(100_000_000, 0), (200_000_000, long));
     }
 
     #[tokio::test(start_paused = true)]
@@ -972,6 +1031,10 @@ mod tests {
         tokio::time::advance(APP_PROBE_CHAIN_GAP).await;
         b.h264_probe_pad(now_std(), false, 0);
         assert_eq!(b.h264.stats.app_probes, 3, "the chain went on");
+        // A chained probe is at 2x, the first of a chain was at 2.5x (literals,
+        // so a change to either constant fails here).
+        let chained = b.active_probe.expect("the chained cluster is open");
+        assert_eq!(chained.target_rate_bps, (est as f64 * 2.0) as u64);
     }
 
     #[tokio::test(start_paused = true)]

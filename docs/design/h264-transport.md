@@ -291,9 +291,10 @@ app probes below run regardless. goog_cc is also never given a `NetworkStateEsti
 every mode. Capacity step-ups in H.264 mode are therefore found by probes of
 ghostframe's own and by the IDR burst.
 
-**App probes** (`h264_start_app_probe`). A probe cluster at 2 x E, 100 ms long
-(at least 5 packets), every `APP_PROBE_INTERVAL` (5 s), where E here is the raw
-`bwe.snapshot().bitrate_bps`, not the rate policy's EWMA. The chain continues
+**App probes** (`h264_start_app_probe`). A probe cluster (at least 5 packets) every `APP_PROBE_INTERVAL` (5 s), where E here is the raw
+`bwe.snapshot().bitrate_bps`, not the rate policy's EWMA. The first probe of a
+chain under 4 Mbit/s is 2.5 x E for 65 ms; every other probe is 2 x E for
+100 ms. The chain continues
 while that raw estimate is at least 0.7 x the previous probe's target rate: the
 next probe follows after 400 ms, up to 4 in a chain. Cluster ids start at 1,000,000,000, a range goog_cc never issues;
 goog_cc measures any cluster id it finds on acknowledged packets. A cluster
@@ -314,13 +315,23 @@ and fell under 0.8 x its pre-step minimum on one. A probe at 2.5 x E gave
 (`queueing_loss_at_a_bottleneck_is_gated`: 5 of 5 seeds engaged FEC, 2 of 5
 at 2 x), the control-law sweep (criteria 3, 4, 6), `browserless_fec_rate`
 (one seed at 0.87) and refs scene 6c (134 of 150 frames, bound 136), so it
-stays at 2 x. The bottleneck failures are not probe-burst losses (gating report
+stayed at 2 x then. The bottleneck failures are not probe-burst losses (gating report
 intervals that overlap a probe's `bundle_seq` span changed nothing): they come
 after the capacity drop, from the overload that follows it, and arrive after
 the tail-drop queue has drained, where the standing-queue gate cannot see them.
-A capacity drop's losses are not the link's random loss; gating the FEC loss
-reading over such an overload episode is the open item that a larger probe
-needs first.
+A capacity drop's losses are not the link's random loss.
+
+**The 2.5 x first probe** (2026-11-23, on the confirmed-loss estimator and the
+FEC rule for unrepairable runs, which cleared the gate and scene failures
+above). Same 48 seeds, the estimate held and used (`sus_use`): 42 of 48 against
+31 at 2 x, median 2.2 s against 5.0 s, p90 10.6 s for both. It is limited to
+estimates under 4 Mbit/s and to 65 ms. At 100 ms it delayed frames by up to
+209 ms at the next probe after a capacity drop. Over 4 Mbit/s the short probe
+barely moved the estimate near capacity (`browserless_fec_rate`, 2 of 16 seeds
+under 0.9), and at 2.5 x it would be skipped above 70 Mbit/s, where 2 x still
+fits to 87 Mbit/s. The accepted cost, at 2 Mbit/s: late frames 1.23 % -> 1.74 %;
+after a drop right behind a spike (scene 6c), 95 % of frames within 20 ms of the
+2 x probe and the slowest 29 to 67 ms later.
 
 **Padding** (`h264_probe_pad`). The cluster is filled with copies of an
 already acknowledged P-frame fragment (at least 600 bytes) under new
