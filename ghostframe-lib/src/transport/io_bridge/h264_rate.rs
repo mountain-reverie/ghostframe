@@ -128,8 +128,9 @@ const APP_PROBE_CHAIN_GAP: Duration = Duration::from_millis(400);
 /// target, and at most this many probes long.
 const APP_PROBE_CHAIN_RATIO: f64 = 0.7;
 const APP_PROBE_CHAIN_MAX: u32 = 4;
-/// A cluster of the application's: lasts `APP_PROBE_DURATION`, at least this
-/// many packets (goog_cc's ALR probes ask for 5).
+/// A cluster of the application's: lasts `APP_PROBE_DURATION` (a high first
+/// probe `APP_PROBE_FIRST_DURATION`), at least this many packets (goog_cc's
+/// ALR probes ask for 5).
 const APP_PROBE_DURATION: Duration = Duration::from_millis(100);
 /// The shortest cluster worth sending (goog_cc's own shortest is 15 ms).
 const APP_PROBE_MIN_DURATION: Duration = Duration::from_millis(15);
@@ -192,9 +193,9 @@ pub(super) struct AppProbe {
     counter: u32,
 }
 
-/// How long after padding the estimate ceiling stays off: the 100 ms window,
-/// the queue the burst builds on the path (up to about 0.3 s on the scenes'
-/// links) and the round trip of the acknowledgements.
+/// How long after padding the estimate ceiling stays off: the window (at most
+/// 100 ms), the queue the burst builds on the path (up to about 0.3 s on the
+/// scenes' links) and the round trip of the acknowledgements.
 pub(super) const PAD_CEILING_HOLD: Duration = Duration::from_millis(1000);
 /// What the frames of a raised probe window still to come are expected to
 /// carry, as a fraction of an average frame at the window's rate, when padding
@@ -655,7 +656,7 @@ impl IoBridge {
     /// window is claimed *before* the frame is planned (goog_cc's request
     /// first, else the application's), and every P frame planned while it is
     /// open gets the window's rate: up to three frames of a 100 ms window at
-    /// 30 fps, 2.1 on average. Once the window is over, the next plan is at the
+    /// 30 fps, 2.1 on average (at most two of a 65 ms first probe). Once the window is over, the next plan is at the
     /// normal rate again, a re-send of the rate buffers that costs a dip of
     /// about 0.5 of the average for two frames (T4). What the
     /// frames do not carry is topped up with padding on the window's last frame
