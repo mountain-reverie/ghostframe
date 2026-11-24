@@ -675,6 +675,9 @@ struct StepSummary {
     raised_delay_max_us: u64,
     /// Probe pads the loss path judged lost (each pauses the raise).
     pads_lost: u64,
+    /// The pre-step estimate (median of the four seconds before the step) over
+    /// the old link's rate: the overshoot before the step.
+    pre_over_link: f64,
 }
 
 impl StepSummary {
@@ -759,6 +762,7 @@ async fn step_summary_deep(
         raised_lost: st.r.h264.refs.raised_frame_lost,
         raised_delay_max_us: st.r.h264.refs.raised_delivery_us_max,
         pads_lost: st.r.h264.stats.pads_lost,
+        pre_over_link: st.pre as f64 / STEP_FROM_BPS as f64,
     }
 }
 
@@ -902,10 +906,10 @@ async fn p_b_seed_population() {
         for i in start..start + n {
             let s = step_summary_deep(0x6701 + i, chatter, delay_us, mode, buffer_ms).await;
             println!(
-                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} sus_est={:?} sus_use={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={} bytes_vs_target={:.3} padding_bytes={} raise_windows={} raise_bytes={} raised_lost={} raised_delay_max_ms={} pads_lost={}",
+                "SEED {:#x} {mode:?} chatter={chatter:?} reached={:?} sus_est={:?} sus_use={:?} guard={:?} lowest/pre-min={:.2} min/pre-min={:.2} saturated={:.2} guard_ok={} padding_windows={} applies_up={} bytes_vs_target={:.3} padding_bytes={} raise_windows={} raise_bytes={} raised_lost={} raised_delay_max_ms={} pads_lost={} pre_over_link={:.3}",
                 s.seed, s.reached, s.sus_est, s.sus_use, s.guard_us, s.low, s.min_all, s.sat_share, s.guard_ok,
                 s.padding_windows, s.applies_up, s.bytes_vs_target, s.padding_bytes,
-                s.raise_windows, s.raise_bytes, s.raised_lost, s.raised_delay_max_us / 1000, s.pads_lost
+                s.raise_windows, s.raise_bytes, s.raised_lost, s.raised_delay_max_us / 1000, s.pads_lost, s.pre_over_link
             );
             all.push(s);
         }
