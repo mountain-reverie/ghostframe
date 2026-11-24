@@ -292,21 +292,14 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
     let test_node = std::sync::Arc::new(
         crate::harness::containers::TestNode::join(client_key, client_control_url).await?,
     );
-    let forwarder = crate::harness::transport::start_forwarder(
-        "127.0.0.1:0",
+    // The TCP and UDP forwarders share one loopback port number: Chrome's
+    // WebTransport connection lands on the same `host:port` as the HTTPS
+    // page load.
+    let forwarder = crate::harness::transport::start_forwarder_pair(
         crate::harness::transport::tailnet_udp_dialer(
             test_node.clone(),
             "ghostframe-server:443".into(),
         ),
-    )
-    .await?;
-
-    // TCP forwarder shares the loopback port number with the UDP forwarder
-    // (TCP and UDP are independent transports). Chrome's WebTransport
-    // connection lands on the same `host:port` as the HTTPS page load.
-    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
-    let tcp_forwarder = crate::harness::transport::start_tcp_forwarder(
-        &tcp_bind,
         test_node.clone(),
         "ghostframe-server:443".to_string(),
     )
@@ -395,7 +388,7 @@ pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioSt
         _browser_handle: browser_handle,
         _test_node: test_node,
         _forwarder: forwarder,
-        _tcp_forwarder: tcp_forwarder,
+        _tcp_forwarder: forwarder,
         _xvfb: xvfb,
         page,
         server_container_name,

@@ -45,9 +45,53 @@ pub fn tailnet_udp_dialer(
 ///
 /// Returns the bound `SocketAddr` that the browser should connect to.
 pub async fn start_forwarder(local_bind: &str, dial: UdpDialer) -> Result<SocketAddr> {
-    let sock = Arc::new(UdpSocket::bind(local_bind).await?);
+    let sock = UdpSocket::bind(local_bind).await?;
     let local = sock.local_addr()?;
+    serve_udp(sock, dial);
+    Ok(local)
+}
 
+/// Binds the UDP forwarder and the TCP forwarder on one loopback port and
+/// starts both. The browser loads the page over TCP and opens WebTransport
+/// over UDP on the same `127.0.0.1:<port>`, so the two port numbers must match.
+///
+/// The UDP port comes from the kernel (port 0), which says nothing about
+/// the TCP port with the same number. That port can already be taken (CI
+/// saw `Address already in use`), so on `AddrInUse` both sockets are
+/// dropped and a new port is drawn.
+pub async fn start_forwarder_pair(
+    dial: UdpDialer,
+    test_node: std::sync::Arc<crate::harness::containers::TestNode>,
+    remote: String,
+) -> Result<SocketAddr> {
+    const ATTEMPTS: usize = 32;
+    for _ in 0..ATTEMPTS {
+        let (sock, listener) = match bind_same_port().await? {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let local = sock.local_addr()?;
+        serve_udp(sock, dial);
+        serve_tcp(listener, test_node, remote);
+        return Ok(local);
+    }
+    anyhow::bail!("no loopback port free for both UDP and TCP after {ATTEMPTS} attempts")
+}
+
+/// One attempt at a loopback UDP socket and a TCP listener on the same port.
+/// `None` when the TCP port is taken.
+async fn bind_same_port() -> Result<Option<(UdpSocket, TcpListener)>> {
+    let sock = UdpSocket::bind("127.0.0.1:0").await?;
+    let port = sock.local_addr()?.port();
+    match TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => Ok(Some((sock, listener))),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn serve_udp(sock: UdpSocket, dial: UdpDialer) {
+    let sock = Arc::new(sock);
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         let mut flows: HashMap<SocketAddr, OwnedWriteHalf> = HashMap::new();
@@ -81,8 +125,6 @@ pub async fn start_forwarder(local_bind: &str, dial: UdpDialer) -> Result<Socket
             }
         }
     });
-
-    Ok(local)
 }
 
 /// Server → browser for one flow: every framed reply goes to `client`, the
@@ -132,7 +174,15 @@ pub async fn start_tcp_forwarder(
 ) -> Result<SocketAddr> {
     let listener = TcpListener::bind(local_bind).await?;
     let local = listener.local_addr()?;
+    serve_tcp(listener, test_node, remote);
+    Ok(local)
+}
 
+fn serve_tcp(
+    listener: TcpListener,
+    test_node: std::sync::Arc<crate::harness::containers::TestNode>,
+    remote: String,
+) {
     tokio::spawn(async move {
         loop {
             let Ok((mut downstream, _)) = listener.accept().await else {
@@ -158,8 +208,6 @@ pub async fn start_tcp_forwarder(
             });
         }
     });
-
-    Ok(local)
 }
 
 #[cfg(test)]
@@ -198,6 +246,27 @@ mod tests {
     /// another connection's socket is undecryptable there, and that
     /// connection stalls. Sending interleaved from two sockets makes a
     /// forwarder that answers "whoever spoke last" deliver the wrong replies.
+    #[tokio::test]
+    async fn the_pair_binds_one_port_and_skips_a_taken_tcp_port() {
+        // Every attempt that succeeds holds UDP and TCP on the same port.
+        let (sock, listener) = loop {
+            if let Some(pair) = bind_same_port().await.unwrap() {
+                break pair;
+            }
+        };
+        let port = sock.local_addr().unwrap().port();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+
+        // With that TCP port held, a TCP bind on it is AddrInUse, which is
+        // the case `bind_same_port` turns into a retry instead of an error.
+        drop(sock);
+        let taken = TcpListener::bind(("127.0.0.1", port)).await;
+        assert_eq!(
+            taken.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+    }
+
     #[tokio::test]
     async fn each_browser_socket_gets_its_own_flow_and_only_its_replies() {
         let dials = Arc::new(AtomicUsize::new(0));
