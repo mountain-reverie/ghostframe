@@ -1417,6 +1417,60 @@ async fn scene6c(seed: u64, spike_tune: Option<(u64, bool)>) -> Scene6c {
     }
 }
 
+/// Diagnostic for scene 6C (not a gate): a per-250 ms timeline of the 5 s
+/// after the drop (frames shown, frames skipped by the encoder gate, bytes
+/// coded, the highest estimate) and the transport's counters, per seed.
+/// `cargo test ... scene6c_timeline -- --ignored --nocapture`.
+#[tokio::test(start_paused = true)]
+#[ignore = "measurement"]
+async fn scene6c_timeline() {
+    for (seed, drop_at) in [
+        (0x7101u64, 7_500_000u64),
+        (0x7102, 7_400_000),
+        (0x7103, 7_500_000),
+    ] {
+        let points = vec![(0, 250_000), (6_000_000, 750_000), (drop_at, 250_000)];
+        let run = DropRun::new(seed, &points, 20, |_| {}).await;
+        let disp: Vec<u64> = run
+            .r
+            .h264_run()
+            .expect("an H.264 scene")
+            .display
+            .iter()
+            .map(|d| u64::from(d.frame_seq) * DEFAULT_CADENCE_US)
+            .collect();
+        println!("tl {seed:#x} drop {drop_at}");
+        for k in 0..24u64 {
+            let from = drop_at - 500_000 + k * 250_000;
+            let to = from + 250_000;
+            let r = from..to;
+            let shown = disp.iter().filter(|t| r.contains(t)).count();
+            let inj = run.injected.iter().filter(|t| r.contains(t)).count();
+            let bytes: usize = run
+                .aus
+                .iter()
+                .filter(|a| r.contains(&a.0))
+                .map(|a| a.1)
+                .sum();
+            let raised = run.aus.iter().filter(|a| r.contains(&a.0) && a.2).count();
+            let est = run
+                .r
+                .bwe_estimate_samples
+                .iter()
+                .filter(|(t, _)| r.contains(t))
+                .map(|x| x.1)
+                .max()
+                .unwrap_or(0);
+            println!(
+                "tl {seed:#x} t={:+5}ms shown {shown:2} injected {inj:2} bytes {bytes:6} raised {raised} est {est}",
+                (from as i64 - drop_at as i64) / 1000
+            );
+        }
+        println!("tl {seed:#x} stats {:?}", run.r.h264.stats);
+        println!("tl {seed:#x} refs {:?}", run.r.h264.refs);
+    }
+}
+
 /// Same seed, same behaviour: two runs of a lossy scene agree on everything
 /// the scenes read (the transport's counters, what each frame was meant to
 /// show, every delivery and its instant, what the client decoded), and another
