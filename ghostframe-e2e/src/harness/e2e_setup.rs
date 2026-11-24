@@ -15,7 +15,7 @@ use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageEx
 
 use crate::harness::containers::{create_preauth_key, TestNode, NETWORK_NAME};
 use crate::harness::e2e_certs::{generate as generate_cert, E2eCert};
-use crate::harness::transport::{start_forwarder, start_tcp_forwarder};
+use crate::harness::transport::start_forwarder_pair;
 use crate::harness::weston::{spawn_weston_headless, WestonGuard};
 
 // Default container/port constants. Some are duplicated from tests/e2e.rs
@@ -199,18 +199,11 @@ pub async fn setup_e2e_server_as(
 
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node = Arc::new(TestNode::join(client_key, client_control_url).await?);
-    let forwarder = start_forwarder(
-        "127.0.0.1:0",
+    let forwarder = start_forwarder_pair(
         crate::harness::transport::tailnet_udp_dialer(
             test_node.clone(),
             "ghostframe-server:443".into(),
         ),
-    )
-    .await?;
-
-    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
-    let tcp_forwarder = start_tcp_forwarder(
-        &tcp_bind,
         test_node.clone(),
         "ghostframe-server:443".to_string(),
     )
@@ -247,7 +240,7 @@ pub async fn setup_e2e_server_as(
         _server: server,
         _test_node: test_node,
         _forwarder: forwarder,
-        _tcp_forwarder: tcp_forwarder,
+        _tcp_forwarder: forwarder,
         xvfb,
         e2e_cert,
         page_url,

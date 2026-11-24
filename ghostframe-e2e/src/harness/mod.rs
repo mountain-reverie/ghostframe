@@ -52,6 +52,7 @@ pub use scene::{
     SceneSpec, ServerTelemetryRecord,
 };
 pub use transport::{
-    start_forwarder, start_static_server, start_tcp_forwarder, tailnet_udp_dialer, UdpDialer,
+    start_forwarder, start_forwarder_pair, start_static_server, start_tcp_forwarder,
+    tailnet_udp_dialer, UdpDialer,
 };
 pub use weston::{parse_weston_xwayland_display, spawn_weston_headless, WestonGuard};

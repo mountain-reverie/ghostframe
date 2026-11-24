@@ -105,15 +105,8 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node =
         std::sync::Arc::new(helpers::TestNode::join(client_key, client_control_url).await?);
-    let forwarder = helpers::start_forwarder(
-        "127.0.0.1:0",
+    let forwarder = helpers::start_forwarder_pair(
         helpers::tailnet_udp_dialer(test_node.clone(), "ghostframe-server:443".into()),
-    )
-    .await?;
-
-    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
-    let _tcp_forwarder = helpers::start_tcp_forwarder(
-        &tcp_bind,
         test_node.clone(),
         "ghostframe-server:443".to_string(),
     )
@@ -438,15 +431,8 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node =
         std::sync::Arc::new(helpers::TestNode::join(client_key, client_control_url).await?);
-    let forwarder = helpers::start_forwarder(
-        "127.0.0.1:0",
+    let forwarder = helpers::start_forwarder_pair(
         helpers::tailnet_udp_dialer(test_node.clone(), "ghostframe-server:443".into()),
-    )
-    .await?;
-
-    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
-    let _tcp_forwarder = helpers::start_tcp_forwarder(
-        &tcp_bind,
         test_node.clone(),
         "ghostframe-server:443".to_string(),
     )
