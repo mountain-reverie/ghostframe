@@ -273,3 +273,72 @@ Remaining: PR-10 (the exit gate and a live run). The legacy Cubic path is delete
 - P8d cold-restart queue peak of 150-236 ms
 - c10 drop-tail duplicate resends of 1.39 per loss
 - live Chrome ACK-decimation check (PR-10)
+
+## Campaign 2026-11-25
+
+Tracks the [2026-11-25 remediation plan](2026-11-25-remediation-plan.md) for the
+[full review](2026-11-25-full-review.md). Base `e85fb005`. States as above, plus
+`stale` (closed by an earlier commit, named in the design section) and `decided`
+(an owner decision, recorded with its date). Owner decisions D1–D12 are in the
+plan, section 3.
+
+| Finding | Sev | Wave | PR (branch) | State |
+|---|---|---|---|---|
+| AV-1 | High | A | `fix/av-decode-error-grid-bounds` | open |
+| AV-2 | High | A | `fix/av-capture-exit-nonzero` (+ D6 restart policy) | open |
+| AV-3 | Med | B | `fix/av-xtest-worker` | open |
+| AV-4 | Med | B | `fix/av-release-held-input` | open |
+| AV-5 | Med | A/B | `fix/av-x11-wait-retryable`, `feat/av-install-records-display` (D6 decided 2026-11-25) | open |
+| AV-6 | Low | B | `fix/av-xtest-worker` | open |
+| AV-7 | Low | A/B | `fix/av-ghostbridge-log-rate-limit`, `fix/av-log-rate-limits` | open |
+| AV-8 | Low | B | `fix/av-session-start-bucket` | open |
+| AV-9 | Low | — | D7 | open (decision) |
+| WP-0 | — | — | 5cd35e7f | stale |
+| WP-1 | Low-Med | B | `wp/seq31` | open |
+| WP-2 | Low | A | `wp/palrle-index-oob` | open |
+| WP-3 | Low | A | `wp/client-net-connect-bounds` | open |
+| WP-4 | Low | A | `wp/h264-drop-refcontinuity` | open |
+| WP-5 | Med | C | `wp/fuzz-nightly` (D4) | open |
+| WP-6 | Med | C | `wp/feedback-codecs-to-protocol` 5a/5b (D1 approved) | open |
+| WP-7 | Low | C | `wp/protocol-consistency` 7a/7b/7c (D5) | open |
+| UF-1 | Med | B | `fix/uf-frame-outputs-view` | open |
+| UF-2 | Low | A | `fix/uf-export-drop-leak-on-busy` | open |
+| UF-3 | Low | A | `fix/uf-gst-download-bounds` | open |
+| UF-4 | Low | B | `fix/uf-frame-outputs-view` | open |
+| UF-5 | Low | B | `fix/uf-borrowed-fd` | open |
+| UF-6 | Info | A | `fix/uf-openh264-trace-unwind` | open |
+| UF-7 | Info | C | `refactor/client-gpu-options` (R1) | open |
+| UF-8 | Med | C/D | `chore/uf-unsafe-lints-*` 7a–7f, 8a–8d | open |
+| LD-1 | High | D | LD-C #17–#25 | open |
+| LD-2 | High | B/C/D | `ld/quic-errors`, `ld/gpu-error`, `ld/bridge-error` | open |
+| LD-3 | High | D | `ld/harness-snapshot`, `ld/harness-hooks`, `ld/harness-cfg-arms` | open |
+| LD-4 | Med | B | `ld/dead-code` | open |
+| LD-5 | Med | D | `ld/tile-coord` (D11, R6) | open |
+| LD-6 | Med | C/D | `ld/gpu-setup-split`, `ld/gpu-setup-guard`, `ld/gpu-frame-split`, `ld/emit-log-*`, `ld/iob-split-emit` | open |
+| LD-7 | Med | D | `ld/pub-surface`, `ld/c-api` (D2 decided: move C API to `ghostframe-server-capi`) | open |
+| LD-8 | Low/Med | B | `ld/config-threading` | open |
+| LD-9 | Low | D | `ld/bridge-clock` | open |
+| LD-10 | Low | D | `ld/comments-*` | open |
+| LD-11 | Med | C | `ld/h264-syntax-crate` (D1 approved) | open |
+| NC-1 | High | B | `fix/native-thread-supervision` | open |
+| NC-2 | High | A/B | `fix/native-texture-limits`, `fix/native-gpu-errors` | open |
+| NC-3 | Med | B | `fix/native-event-queue-bounds` | open |
+| NC-4 | Med | B | `fix/native-thread-supervision` | open |
+| NC-5 | Med | C | `feat/capi-abi-v1` (D10), `refactor/client-gpu-options` | open |
+| NC-6 | Med/Low | C | `refactor/client-gpu-options` | open |
+| NC-7 | Low/Med | C | `fix/native-gpu-errors`, `chore/client-hygiene` | open |
+| NC-8 | Low | B/C | `fix/native-thread-supervision`, `chore/client-hygiene` (D9) | open |
+| NC-9 | — | — | shared via `ghostframe-render` | stale |
+| NC-10 | Med | C | `fix/cli-state-dir` (D1 approved) | open |
+| EC-1 | High | B | `ec/test-feature-isolation` | open |
+| EC-2 | Med | B | `ec/crypto-single-provider` | open |
+| EC-3 | Med | B | `ec/cargo-deny` (D3) | open |
+| EC-4 | Med | C/D | `ec/lints-table`, `ec/lints-<crate>`, `ec/edition-2024-<crate>` | open |
+| EC-5 | Med | A/B | `ec/go-hermetic` | open |
+| EC-6 | Med | D | folded into `ld/c-api` (D2 decided 2026-11-25: keep, move to `ghostframe-server-capi`) | open |
+| EC-7 | Low/Med | B | `ec/manifest-policy` (D8) | open |
+| EC-8 | Low/Med | C | `ec/ci-single-source` (R5) | open |
+| EC-9 | Low | C | `ec/spirv-gate` | open |
+| EC-10 | Low | C | `ec/e2e-dedupe` | open |
+| EC-11 | Low | A | `ec/repo-hygiene` | open |
+| EC-12 | Low | C | `ec/e2e-dedupe` | open |
