@@ -48,3 +48,11 @@ tools/hw-probe/*.h264
 # 2026-09-22) because `git add -A` sweeps untracked files. Test fixtures and
 # golden images live under */fixtures/ and */golden/ and are unaffected.
 Screenshot*.png
+
+# Live-session captures and scratch output dropped in the repo root.
+/*.log
+/crates.txt
+# Local handoff / field-report notes (keep them outside the repo, e.g.
+# ../gf-notes-archive/). Anchored to the root so docs/** is unaffected.
+/gf-handoff-*.md
+/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md
