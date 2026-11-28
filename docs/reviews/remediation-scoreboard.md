@@ -340,5 +340,5 @@ plan, section 3.
 | EC-8 | Low/Med | C | `ec/ci-single-source` (R5) | open |
 | EC-9 | Low | C | `ec/spirv-gate` | open |
 | EC-10 | Low | C | `ec/e2e-dedupe` | open |
-| EC-11 | Low | A | `ec/repo-hygiene` | open |
+| EC-11 | Low | A | `ec/repo-hygiene` | pr #335 |
 | EC-12 | Low | C | `ec/e2e-dedupe` | open |
